@@ -1,0 +1,13 @@
+# Secrets — never commit real API keys or config.
+.env
+.env.*.local
+
+# Dependencies
+node_modules/
+
+# Runtime logs
+logs/*.log
+
+# OS/editor cruft.
+.DS_Store
+Thumbs.db

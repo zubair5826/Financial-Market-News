@@ -1,0 +1,13 @@
+{
+  "name": "trading-intelligence-system",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Multi-agent AI Trading Intelligence System — all 8 agents and orchestrator implemented and tested; no live provider/broker/exchange connection or trade execution exists",
+  "main": "orchestrator/index.js",
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
