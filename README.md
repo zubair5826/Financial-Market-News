@@ -6,19 +6,29 @@ between the two.
 
 ## Status
 
-**Core system implemented and tested. No live data connection.**
+**Core system implemented and tested. Macro, technical, and news
+providers are integrated; no broker/exchange connection or trade
+execution exists.**
 
 All 8 agents, the shared contracts, and the orchestrator that wires
-them together are IMPLEMENTED and covered by an automated test suite
-(492 tests, 0 failures as of the last full run). What is **not**
-implemented is any connection to a real data source: no market data
-feed, no news/macro/sentiment provider, no broker, no exchange, and no
-trade execution exist anywhere in this codebase. Every test runs
-against synthetic, in-memory fixture data only.
+them together are IMPLEMENTED and covered by an automated test suite.
+Two real, live data providers are also IMPLEMENTED and tested: FRED
+(macro data, for the Macro Agent) and Alpha Vantage (daily price
+candles for the Technical Agent, and news for the News Agent) — see
+[Provider Abstraction](#provider-abstraction-providers) below.
+Sentiment, and the Data Controller's own generic `marketData` domain,
+still have no connected provider. No broker, no exchange, and no trade
+execution exist anywhere in this codebase. Every automated test in
+this repository runs against synthetic, in-memory, or mocked fixture
+data only — no test requires real credentials or makes a real network
+call.
 
-In short: the *reasoning pipeline* is real and working end to end; the
-*data* it reasons about is currently supplied by hand (tests) or must
-be supplied by a caller — nothing is fetched from the outside world.
+In short: the *reasoning pipeline* is real and working end to end;
+three of its data domains (macro, technical, and news) can now be
+populated from a real, live external source when real credentials are
+supplied; the other two (sentiment, and the Data Controller's generic
+market-value domain) still have their data supplied by hand (tests) or
+by a caller.
 
 ## System Architecture
 
@@ -152,7 +162,8 @@ the Step 13 security audit.
 - **Data Freshness** (`core/freshness.js`) — `FRESH / AGING / STALE /
   UNKNOWN`, computed from a real timestamp and **caller-supplied**
   thresholds only (no hard-coded default — different data types need
-  different windows, and no data type has a chosen provider yet).
+  different windows, and no single threshold has been calibrated
+  against sustained real production traffic for any of them).
 - **Source Verification** (`core/verification.js`) — `VERIFIED_PRIMARY
   / VERIFIED_SECONDARY / UNVERIFIED / CONFLICTING / UNKNOWN`.
   `reconcileSources()` never auto-resolves a disagreement — it returns
@@ -174,12 +185,14 @@ the Step 13 security audit.
 
 ## Provider Abstraction (`providers/`)
 
-**IMPLEMENTED (interface only). NOT IMPLEMENTED (any real provider).**
+**IMPLEMENTED — the abstract interface, plus two real, tested provider
+integrations (FRED for macro; Alpha Vantage for technical price
+candles and news).** Sentiment, and the Data Controller's own generic
+`marketData` domain, have no connected provider yet.
 
 `ProviderAdapter` ([providers/ProviderAdapter.js](providers/ProviderAdapter.js))
 is an abstract base class — it cannot be instantiated directly
-(test-enforced) — defining the contract every future provider must
-implement:
+(test-enforced) — defining the contract every provider implements:
 
 ```js
 class MyProvider extends ProviderAdapter {
@@ -216,41 +229,64 @@ response into the agent's input array shape (or return a `failSafe()`
 result on any failure), and hand that array to the corresponding
 `run*Agent()` function. **No agent code changes required.**
 
-### Provider integration plan (FUTURE — not started)
+### Provider integration plan — completed for macro, technical, and news
 
-1. Choose and document a specific provider per domain (market data,
-   news, macro, sentiment) — none chosen yet, intentionally.
+The plan below was executed for three of the four domains (macro via
+FRED; technical price candles and news via Alpha Vantage). Sentiment,
+and the Data Controller's own generic `marketData` domain, still have
+no connected provider and remain future work.
+
+1. Choose and document a specific provider per domain — done for
+   technical (candles), news, and macro (see Step 16 below); sentiment
+   and the Data Controller's `marketData` domain remain unchosen,
+   intentionally.
 2. Implement one `ProviderAdapter` subclass per provider under
-   `providers/`, each calling the real API and mapping the response
-   into that domain's input record shape (or a `failSafe()` result).
+   `providers/adapters/`, each calling the real API and mapping the
+   response into that domain's input record shape (or a `failSafe()`
+   result) — done for FRED and Alpha Vantage (technical + news).
 3. Add that provider's credentials to `.env` (never committed — see
    [Security](#security)) and read them via `process.env` **only**
-   inside that adapter file.
-4. Wire the adapter into the orchestrator's request-building step
-   (upstream of `processRequest()` — the orchestrator itself does not
-   change) so `request.newsData` etc. are populated from a live call
-   instead of a caller-supplied array.
+   inside that adapter's live-source file — done: `FRED_API_KEY` is
+   read solely in `providers/fredMacroLiveSource.js`, and
+   `ALPHAVANTAGE_API_KEY` is read solely in
+   `providers/alphaVantageMarketLiveSource.js` and
+   `providers/alphaVantageNewsLiveSource.js`.
+4. Wire the adapter into the request-building step upstream of
+   `processRequest()` (the orchestrator itself is unmodified) — done
+   via `providers/fredMacroApplicationService.js` and
+   `providers/marketIntelligenceApplicationService.js`, which compose
+   live provider data into a request before calling the existing,
+   unmodified `processRequest()` exactly once.
 5. Every failure mode the adapter can hit (`API_UNAVAILABLE, TIMEOUT,
    RATE_LIMIT, AUTH_FAILURE, INVALID_RESPONSE`) maps directly onto an
-   existing `core/errors.js` code — no new error-handling design is
-   needed downstream.
+   existing `core/errors.js` code — implemented and covered by mocked
+   tests in each adapter's own test suite (see [Fail-Safe
+   Guarantees](#fail-safe-guarantees)).
 
-### Step 15 — first-integration recommendation (PREPARATION ONLY)
+A real, discovered-and-fixed issue along the way: Alpha Vantage's free
+tier enforces a real "1 request per second" burst limit (separate from
+its daily quota). `providers/marketIntelligenceApplicationService.js`
+acquires market and news data sequentially with a fixed 1100ms delay
+between them to stay under it; FRED (a separate account) is
+unaffected and remains concurrent.
+
+### Step 15 — first-integration recommendation (historical)
 
 A Step 15 audit evaluated Market Data, News, Macro, and Sentiment as
-candidates for the **first** real provider integration (still
-**FUTURE** — no provider is connected). **Macro was recommended**:
+candidates for the first real provider integration. **Macro was
+recommended**:
 its data is discrete/scheduled (not a continuous stream, so far lower
 rate-limit pressure), typically sourced from authoritative
 calendar/statistical-agency providers (a stronger fit for
 `VERIFIED_PRIMARY`/`VERIFIED_SECONDARY`), numeric rather than
 natural-language (no subjective interpretation burden on the
 provider), and freshness is naturally well-defined around each
-release's scheduled time. Market Data was ranked last: its Data
-Controller output currently isn't consumed by any downstream agent
-(Trade Setup/Risk Manager/Chief Trading Manager never read it), so
-integrating it first would add real-world risk surface (a live feed)
-without changing any decision the system produces.
+release's scheduled time. Market Data (the Data Controller's generic
+domain) was ranked last at the time of that audit and remains
+unintegrated today; News has since been integrated (via Alpha
+Vantage), and Alpha Vantage was also brought in as the Technical
+Agent's provider (distinct from the Data Controller's Market Data
+domain — see [Provider Abstraction](#provider-abstraction-providers)).
 
 One real, documented gap: `options.fieldMap` is a single object shared
 identically across all 4 specialists in one request (see
@@ -259,13 +295,15 @@ This is not a problem for a single-domain (e.g. Macro-only) first
 integration, but would need either per-domain-prefixed options or
 adapter-side mapping (before data reaches `run*Agent()`) once two
 differently-shaped live providers are combined in one request. Not
-fixed — not required for a single first integration.
+fixed — not required for the integrations built so far, since each
+composes its own request independently.
 
-### Step 16 — Macro provider selected for future integration (NOT CONNECTED)
+### Step 16 — Macro provider selected and connected: FRED
 
-**SELECTED FOR FUTURE INTEGRATION: FRED (Federal Reserve Economic
-Data, Federal Reserve Bank of St. Louis)** — `fred.stlouisfed.org`.
-**No account, API key, or connection exists.** Chosen over Financial
+**FRED (Federal Reserve Economic Data, Federal Reserve Bank of St.
+Louis)** — `fred.stlouisfed.org` — is implemented and tested
+(`providers/adapters/fredMacroAdapter.js` and the surrounding
+live-source/application-service layer). Chosen over Financial
 Modeling Prep's economic calendar (a third-party source flagged that
 endpoint as possibly deprecated — unconfirmed), Trading Economics (no
 free tier found — paid plans only, per third-party pricing summaries),
@@ -274,10 +312,11 @@ consensus values and no calendar/scheduled-release concept) because it
 is the most authoritative source available (the original statistical
 agency for most of its series), free with a generous documented rate
 limit (~120 requests/minute — sourced from search results, not a
-direct primary fetch; **treat as needing final confirmation before any
-real connection**), simplest to authenticate (a single API key, no
-OAuth/signing), and has the longest operating history of any candidate
-evaluated.
+direct primary fetch; **this figure has not been re-confirmed against
+a real, sustained production load**), simplest to authenticate (a
+single API key, no OAuth/signing), and has the longest operating
+history of any candidate evaluated. Alpha Vantage was separately
+integrated for technical price candles and news (see above).
 
 **Known, real limitation, not a defect:** FRED provides `actual_value`
 and prior-period values (as `previous_value`) but **no forecast/
@@ -287,19 +326,21 @@ FRED-sourced records. This is correct, honest behavior under the
 existing contract, not something to work around.
 
 See the full Step 16 report for the complete field mapping, fail-safe
-matrix, and pre-live checklist — none of it implemented yet.
+matrix, and pre-live checklist — now implemented for FRED and Alpha
+Vantage, as described above.
 
 ## Environments
 
-No environment-specific code exists yet — the system currently runs
-identically everywhere because no provider is connected. This section
-documents the **intended** distinction for when one is:
+No `NODE_ENV`-driven code branching exists yet — every environment
+runs the same code paths. What differs across environments is which
+provider credentials are present and whether real network calls are
+made:
 
 | Environment | Purpose | Data source | Credentials |
 |---|---|---|---|
-| **development** | Local iteration | Synthetic fixtures or a caller-supplied request, same as tests | None required |
-| **testing** | CI / `npm test` | Synthetic, in-memory fixtures only (`tests/`, `agents/*/*.test.js`) — never a real network call | None — tests must never require real credentials |
-| **production** (FUTURE) | Real usage | Live provider adapters (once built, per the integration plan above) | Real values, in `.env` only, never committed, never hard-coded, never logged |
+| **development** | Local iteration | Synthetic fixtures, a caller-supplied request, or live FRED/Alpha Vantage calls if credentials are set | `FRED_API_KEY`/`ALPHAVANTAGE_API_KEY` only if live calls are wanted |
+| **testing** | CI / `npm test` | Synthetic, in-memory, or mocked fixtures only (`tests/`, `agents/*/*.test.js`, `providers/**/*.test.js`) — never a real network call | None — tests must never require real credentials |
+| **production** | Real usage | Live FRED and Alpha Vantage calls via the existing adapters, for macro/technical/news; sentiment and the Data Controller's `marketData` domain remain caller-supplied | Real values, in `.env` only, never committed, never hard-coded, never logged |
 
 `NODE_ENV` (documented in [.env.example](.env.example)) is the
 intended selector (`development` / `test` / `production`), read via
@@ -310,11 +351,15 @@ in any environment.**
 
 ## Security
 
-- **No secrets in source.** Verified repo-wide: zero `process.env`
-  usage, zero hard-coded key-shaped strings (`sk-`, `AKIA`, `ghp_`,
-  PEM blocks, etc.), zero network calls (`fetch`/`axios`/`http.request`/
-  `WebSocket`) anywhere in `core/`, `agents/`, `providers/`,
-  `orchestrator/`.
+- **No secrets in source.** Zero hard-coded key-shaped strings
+  (`sk-`, `AKIA`, `ghp_`, PEM blocks, etc.) anywhere in the repo.
+  `process.env` and real network calls (`fetch`) are used **only**
+  inside the FRED and Alpha Vantage live-source files
+  (`providers/fredMacroLiveSource.js`,
+  `providers/alphaVantageMarketLiveSource.js`,
+  `providers/alphaVantageNewsLiveSource.js` — each the sole reader of
+  its own credential) — verified absent everywhere else, including
+  `core/`, `agents/`, `orchestrator/`, and the rest of `providers/`.
 - **`.env` is gitignored** ([.gitignore](.gitignore)), along with
   `.env.*.local`. Only [.env.example](.env.example) is committed, and
   it contains no real values — see [Environments](#environments).
@@ -358,16 +403,17 @@ warning/error instead:
 | Missing data | Absent/empty input arrays produce `UNKNOWN`-bias reports, never invented values; missing specialists are explicitly listed (`collectReports().missing`) | Tested today |
 | Stale data | `computeFreshness()` returns `STALE` past `agingMaxMs`; News Agent raises `failSafe(STALE_DATA, ...)`, surfaced up to the top-level response | Tested today |
 | Conflicting data | `reconcileSources()` / domain conflict detectors return `CONFLICTING`/populate `conflicts`, never auto-resolved; visible through Trade Setup's `conflicting_evidence` and Chief Trading Manager's `CONFLICTING_EVIDENCE` state | Tested today |
-| API unavailable | `ProviderAdapter.fetchData()` contract requires either `{ ok: true, data }` or a `failSafe(API_UNAVAILABLE, ...)` result | Design-verified; **not reproducible today — no real provider exists to fail** |
-| Timeout | Same contract — a timeout maps to `failSafe(TIMEOUT, ...)` | Design-verified; **not reproducible today** |
-| Rate limit | Same contract — maps to `failSafe(RATE_LIMIT, ...)` | Design-verified; **not reproducible today** |
-| Authentication failure | Same contract — maps to `failSafe(AUTH_FAILURE, ...)`, and no adapter would ever log the credential itself (see Security) | Design-verified; **not reproducible today** |
+| API unavailable | `ProviderAdapter.fetchData()` contract requires either `{ ok: true, data }` or a `failSafe(API_UNAVAILABLE, ...)` result | Tested today, via mocked FRED/Alpha Vantage responses in each adapter's own test suite |
+| Timeout | Same contract — a timeout maps to `failSafe(TIMEOUT, ...)` | Tested today, via mocked responses |
+| Rate limit | Same contract — maps to `failSafe(RATE_LIMIT, ...)`; Alpha Vantage's real per-second burst limit is additionally handled by a sequential-acquisition delay (see [Provider Abstraction](#provider-abstraction-providers)) | Tested today, via mocked responses |
+| Authentication failure | Same contract — maps to `failSafe(AUTH_FAILURE, ...)`, and no adapter would ever log the credential itself (see Security) | Tested today, via mocked responses |
 
-The four "design-verified" rows cannot be exercised by an automated
-test yet because no concrete provider exists to actually time out,
-rate-limit, or reject authentication — that becomes testable once a
-real `ProviderAdapter` subclass is built (see [Provider integration
-plan](#provider-integration-plan-future--not-started)).
+The four rows above are exercised by mocked provider responses in
+`providers/adapters/*.test.js` and the surrounding live-source/
+application-service test files — they do not make a real network call
+(no automated test does), but they do exercise the real FRED/Alpha
+Vantage adapter code against a simulated failure response, not just a
+design review.
 
 ## Testing
 
@@ -376,26 +422,36 @@ npm test
 ```
 
 Runs Node's built-in test runner (`node --test`) across every
-`*.test.js` file in `agents/` and `tests/`. **492 tests, 0 failures**
-as of the last full run (Node v24.19.0). No external dependencies, no
-network access, and no real credentials are required to run the suite
-— every test uses synthetic, hand-constructed fixture data.
+`*.test.js` file in the repository, including `agents/`, `tests/`,
+`providers/` (and its `adapters/` subfolder). No external
+dependencies, no real network access, and no real credentials are
+required to run the suite — every test uses synthetic, hand-constructed,
+or mocked fixture data. Run `npm test` for the current pass/fail count.
 
 Coverage includes: every core contract, every agent's own unit tests
 (structural validation, freshness, verification, classification
 pass-through, bias/indicator correctness, no-fabrication assertions),
 the orchestrator's individual functions in isolation
-([tests/orchestrator.test.js](tests/orchestrator.test.js)), and a full
+([tests/orchestrator.test.js](tests/orchestrator.test.js)), a full
 13-scenario end-to-end pipeline suite exercising all 8 real agents
-together ([tests/pipeline.test.js](tests/pipeline.test.js)).
+together ([tests/pipeline.test.js](tests/pipeline.test.js)), and the
+FRED/Alpha Vantage adapter, live-source, and application-service test
+suites under `providers/` (including mocked failure-mode coverage —
+see [Fail-Safe Guarantees](#fail-safe-guarantees)).
 
 ## Known Limitations
 
-- **No real data anywhere.** Every number, headline, and price in this
-  system's test suite is synthetic. Nothing has ever been validated
-  against real market behavior.
-- **No provider chosen.** Market data, news, macro, and sentiment
-  providers are all `UNKNOWN` — none selected, none assumed.
+- **No real data in the automated test suite.** Every number,
+  headline, and price used by `npm test` is synthetic or mocked.
+  Real FRED/Alpha Vantage responses were exercised manually during
+  development (which is how the Alpha Vantage per-second rate limit,
+  documented above, was discovered) — not as part of the committed,
+  repeatable automated suite.
+- **Sentiment, and the Data Controller's generic `marketData` domain,
+  have no chosen provider.** Technical price candles and news
+  (Alpha Vantage) and macro (FRED) are integrated; sentiment and
+  the Data Controller's own domain remain `UNKNOWN` — not selected,
+  not assumed.
 - **No HTTP server or CLI entrypoint.** `processRequest()` must be
   called directly by a Node process; there is no way to reach this
   system over a network yet.
@@ -407,8 +463,8 @@ together ([tests/pipeline.test.js](tests/pipeline.test.js)).
   don't exist yet.
 - **Freshness/quality/confidence thresholds are all caller-supplied**
   with documented defaults in a few places (e.g. Trade Setup's quality
-  thresholds) — none represent a real-world-calibrated value, since no
-  real data has ever flowed through this system.
+  thresholds) — none represent a real-world-calibrated value; they
+  have not been tuned against sustained real production traffic.
 - **No automatic or manual trade execution, anywhere, under any
   configuration.** This system produces decision *intelligence*
   (bias, setup, risk, and decision-status labels) — it has no code
@@ -419,8 +475,8 @@ together ([tests/pipeline.test.js](tests/pipeline.test.js)).
 - `core/` — shared contracts. **IMPLEMENTED.**
 - `agents/` — all 8 agents. **IMPLEMENTED.**
 - `orchestrator/` — full pipeline wiring (`processRequest()`). **IMPLEMENTED.**
-- `providers/` — provider adapter interface only. **IMPLEMENTED**
-  (interface); **NOT IMPLEMENTED** (any real provider) — see [Provider
+- `providers/` — the abstract adapter interface, plus real FRED and
+  Alpha Vantage integrations. **IMPLEMENTED** — see [Provider
   Abstraction](#provider-abstraction-providers).
 - `logs/` — logging foundation + runtime log output. **IMPLEMENTED.**
 - `tests/` — cross-cutting contract, orchestrator, and end-to-end
