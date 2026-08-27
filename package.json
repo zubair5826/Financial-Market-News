@@ -5,6 +5,7 @@
   "description": "Multi-agent AI Trading Intelligence System — all 8 agents and orchestrator implemented and tested; FRED (macro) and Alpha Vantage (technical, news) provider integrations implemented and tested; no broker/exchange connection or trade execution exists",
   "main": "orchestrator/index.js",
   "scripts": {
+    "start": "node server.js",
     "test": "node --test"
   },
   "engines": {
