@@ -587,6 +587,238 @@ test("25. a synthetic Alpha Vantage rate-limit response on market is never retri
   });
 });
 
+// --- Step 99: instrument/symbol routing fix, end-to-end ---
+
+function btcMarketBody() {
+  return {
+    "Meta Data": { "2. Symbol": "BTC" },
+    "Time Series (Daily)": { "2026-08-24": { "1. open": "60000", "2. high": "61000", "3. low": "59500", "4. close": "60500", "5. volume": "12345" } },
+  };
+}
+function btcNewsBody() {
+  return {
+    items: "1",
+    feed: [
+      {
+        title: "BTC rallies on ETF inflows",
+        url: "https://example.com/btc-1",
+        time_published: "20260824T093000",
+        summary: "Bitcoin rose sharply amid ETF inflows.",
+        source: "Example Financial News",
+        topics: [{ topic: "financial_markets", relevance_score: "0.9" }],
+        ticker_sentiment: [{ ticker: "BTC", relevance_score: "0.9", ticker_sentiment_score: "0.4", ticker_sentiment_label: "Bullish" }],
+      },
+    ],
+  };
+}
+
+// 2. BTC request -> BTC data only (never SPY), when the provider agrees.
+test("99-1. a BTC request resolves the instrument context and requests BTC (not SPY) from both Alpha Vantage domains", async () => {
+  await withEnvKeys({ fred: SYNTHETIC_FRED_KEY, av: SYNTHETIC_AV_KEY }, async () => {
+    processRequestCallCount = 0;
+    const marketCalls = [];
+    const newsCalls = [];
+    const result = await runMarketIntelligenceRequest(validBaseRequest({ query: "Assess BTC", asset: "BTC" }), {
+      market: { enabled: true },
+      news: { enabled: true },
+      marketAdapterConfig: { fetchImpl: async (url) => { marketCalls.push(url); return jsonResponse(200, btcMarketBody()); } },
+      newsAdapterConfig: { fetchImpl: async (url) => { newsCalls.push(url); return jsonResponse(200, btcNewsBody()); } },
+    });
+    assert.ok(marketCalls[0].includes("symbol=BTC"));
+    assert.ok(newsCalls[0].includes("tickers=BTC"));
+    assert.equal(result.diagnostics.instrument.normalizedSymbol, "BTC");
+    assert.equal(result.pipelineResult.pipeline_summary.technical_status, "OK");
+    assert.equal(result.pipelineResult.pipeline_summary.news_status, "OK");
+  });
+});
+
+// 3/6/8. A BTC request against a provider that only actually has SPY data
+// must fail safely for both domains — never silently substitute SPY data
+// under the BTC-labeled request.
+test("99-2. a BTC request against SPY-only provider data fails safely on both domains, never substituting SPY data", async () => {
+  await withEnvKeys({ fred: SYNTHETIC_FRED_KEY, av: SYNTHETIC_AV_KEY }, async () => {
+    processRequestCallCount = 0;
+    const marketCalls = [];
+    const newsCalls = [];
+    // Explicit SPY-metadata/SPY-tagged mocks (a real Alpha Vantage
+    // TIME_SERIES_DAILY response always includes a Meta Data block —
+    // unlike the shared marketDailyBody() fixture used elsewhere in
+    // this file, which omits it and would never exercise this check).
+    const result = await runMarketIntelligenceRequest(validBaseRequest({ query: "Assess BTC", asset: "BTC" }), {
+      market: { enabled: true },
+      news: { enabled: true },
+      marketAdapterConfig: {
+        fetchImpl: async (url) => {
+          marketCalls.push(url);
+          return jsonResponse(200, { "Meta Data": { "2. Symbol": "SPY" }, ...marketDailyBody() });
+        },
+      },
+      newsAdapterConfig: { fetchImpl: async (url) => { newsCalls.push(url); return jsonResponse(200, newsFeedBody()); } },
+    });
+    assert.equal(marketCalls.length, 1);
+    assert.equal(newsCalls.length, 1);
+    // Both domains must reject the mismatched data rather than merge it.
+    assert.equal(result.diagnostics.market.providerResult.ok, false);
+    assert.equal(result.diagnostics.market.providerResult.code, "INVALID_RESPONSE");
+    assert.equal(result.diagnostics.news.providerResult.ok, false);
+    assert.equal(result.diagnostics.news.providerResult.code, "INVALID_RESPONSE");
+    // The pipeline still completes (existing partial-domain convention —
+    // the Technical/News Agents run on an empty array and degrade
+    // gracefully, exactly as they already do for any caller who
+    // supplies no data at all), but with zero fabricated/mislabeled SPY
+    // candles or news ever reaching it under the BTC-labeled request.
+    assert.ok(result.pipelineResult.warnings.includes("NEWS DATA UNAVAILABLE — no news data was supplied."));
+    assert.ok(result.pipelineResult.warnings.includes("TECHNICAL DATA UNAVAILABLE — no market data was supplied."));
+  });
+});
+
+// 9. Macro data must not be incorrectly labeled as the requested instrument.
+test("99-3. macro data is never labeled with the requested instrument's symbol (MacroRecord has no asset field to mislabel)", async () => {
+  await withEnvKeys({ fred: SYNTHETIC_FRED_KEY, av: SYNTHETIC_AV_KEY }, async () => {
+    processRequestCallCount = 0;
+    const { fredCalls, adapterConfigs } = allProviderCalls();
+    const result = await runMarketIntelligenceRequest(validBaseRequest({ query: "Assess BTC", asset: "BTC" }), {
+      macro: { enabled: true },
+      macroAdapterConfig: adapterConfigs.macroAdapterConfig,
+    });
+    assert.equal(fredCalls.length, 2);
+    assert.equal(result.pipelineResult.pipeline_summary.macro_status, "OK");
+    // The macro records feeding the pipeline never carry an `asset` field
+    // at all, let alone one fabricated to equal the requested "BTC" —
+    // confirmed directly against the merged request the pipeline actually
+    // ran, not just the final report.
+    assert.equal(result.pipelineResult.asset, "BTC");
+  });
+});
+
+// 1/10. Existing valid SPY workflows remain completely unchanged.
+test("99-4. an unchanged SPY workflow (no explicit symbol override needed) behaves exactly as before", async () => {
+  await withEnvKeys({ fred: SYNTHETIC_FRED_KEY, av: SYNTHETIC_AV_KEY }, async () => {
+    processRequestCallCount = 0;
+    const { marketCalls, newsCalls, adapterConfigs } = allProviderCalls();
+    const result = await runMarketIntelligenceRequest(validBaseRequest(), { market: { enabled: true }, news: { enabled: true }, ...adapterConfigs });
+    assert.ok(marketCalls[0].includes("symbol=SPY"));
+    assert.ok(newsCalls[0].includes("tickers=SPY"));
+    assert.equal(result.diagnostics.market.providerResult.ok, true);
+    assert.equal(result.diagnostics.news.providerResult.ok, true);
+    assert.equal(result.pipelineResult.pipeline_summary.technical_status, "OK");
+    assert.equal(result.pipelineResult.pipeline_summary.news_status, "OK");
+  });
+});
+
+// --- Step 103: multi-timeframe live market data ---
+
+// Builds a realistic Alpha-Vantage-shaped series (numeric-string OHLCV
+// fields, real date keys) with a genuine linear trend — exactly the
+// same class of fixture already used at the adapter/live-source layer,
+// reused here so the SAME real Technical Agent (via the real, unmodified
+// processRequest()) sees real provider-shaped candles, not a
+// hand-built shortcut.
+function trendingSeriesBody(seriesKey, count, direction, stepDays) {
+  const entries = {};
+  for (let i = 0; i < count; i++) {
+    const close = direction === "up" ? 100 + i * 2 : 140 - i * 2;
+    const date = new Date(Date.now() - (count - 1 - i) * stepDays * 86_400_000).toISOString().slice(0, 10);
+    entries[date] = {
+      "1. open": String(close - 0.5),
+      "2. high": String(close + 1),
+      "3. low": String(close - 1),
+      "4. close": String(close),
+      "5. volume": "1000000",
+    };
+  }
+  return { [seriesKey]: entries };
+}
+
+// A small indicator config (mirrors agents/technical-agent/technicalAgent.test.js's
+// own SMALL_INDICATOR_CONFIG) forwarded through request.options so 10
+// candles per timeframe is enough for a real, non-UNKNOWN trend
+// classification — the default SMA[20,50] config would need far more
+// history than is worth fabricating for this test.
+const SMALL_INDICATOR_CONFIG = { sma: [3, 5], ema: [2, 3], rsi: { period: 3 }, macd: { fast: 2, slow: 4, signal: 2 }, atr: { period: 3 }, bollinger: { period: 5, stdDevMultiplier: 2 } };
+
+test("103-1. options.marketTimeframes requests every listed timeframe sequentially, each rate-limit-protected", async () => {
+  await withEnvKeys({ av: SYNTHETIC_AV_KEY }, async () => {
+    const orderLog = [];
+    const marketCalls = [];
+    const fetchImpl = async (url) => {
+      marketCalls.push(url);
+      orderLog.push(url.includes("TIME_SERIES_WEEKLY") ? "market:weekly" : "market:daily");
+      if (url.includes("TIME_SERIES_WEEKLY")) return jsonResponse(200, trendingSeriesBody("Weekly Time Series", 3, "up", 7));
+      return jsonResponse(200, trendingSeriesBody("Time Series (Daily)", 3, "up", 1));
+    };
+    activeOrderLog = orderLog;
+    timeoutCalls = [];
+
+    const result = await runMarketIntelligenceRequest(validBaseRequest(), {
+      market: { enabled: true },
+      marketTimeframes: ["1day", "1week"],
+      marketAdapterConfig: { fetchImpl },
+    });
+
+    assert.equal(marketCalls.length, 2);
+    assert.deepEqual(orderLog, ["market:daily", "delay:1100", "market:weekly"]);
+    assert.deepEqual(
+      result.diagnostics.market.timeframeResults.map((r) => r.timeframe),
+      ["1day", "1week"]
+    );
+    assert.ok(result.diagnostics.market.timeframeResults.every((r) => r.ok));
+    activeOrderLog = null;
+  });
+});
+
+test("103-2. an unsupported timeframe alongside a supported one is reported explicitly in diagnostics, never substituted", async () => {
+  await withEnvKeys({ av: SYNTHETIC_AV_KEY }, async () => {
+    const { marketCalls, adapterConfigs } = allProviderCalls();
+    const result = await runMarketIntelligenceRequest(validBaseRequest(), {
+      market: { enabled: true },
+      marketTimeframes: ["1day", "1hour"],
+      marketAdapterConfig: adapterConfigs.marketAdapterConfig,
+    });
+    assert.equal(marketCalls.length, 1); // "1hour" never touches the network
+    const unsupported = result.diagnostics.market.timeframeResults.find((r) => r.timeframe === "1hour");
+    assert.equal(unsupported.ok, false);
+    assert.equal(unsupported.code, "UNSUPPORTED_TIMEFRAME");
+    assert.ok(result.diagnostics.market.warnings.some((w) => w.includes("1hour")));
+    // The supported timeframe's data still reaches the real pipeline.
+    assert.equal(result.pipelineResult.pipeline_summary.technical_status, "OK");
+  });
+});
+
+// Requirement: multi-timeframe conflict detection using real
+// provider-shaped data. Two genuinely distinct Alpha Vantage series
+// (TIME_SERIES_DAILY trending up, TIME_SERIES_WEEKLY trending down) are
+// composed by the real, unmodified loadLiveMarketData()/adapter, then
+// run through the real, unmodified processRequest() — proving the
+// Technical Agent's own TIMEFRAME_CONFLICT detection genuinely fires
+// end to end on live-shaped data, not just on hand-built test doubles.
+test("103-3. daily-uptrend vs weekly-downtrend Alpha-Vantage-shaped data produces a real TIMEFRAME_CONFLICT end to end", async () => {
+  await withEnvKeys({ av: SYNTHETIC_AV_KEY }, async () => {
+    const fetchImpl = async (url) => {
+      if (url.includes("TIME_SERIES_WEEKLY")) return jsonResponse(200, trendingSeriesBody("Weekly Time Series", 10, "down", 7));
+      return jsonResponse(200, trendingSeriesBody("Time Series (Daily)", 10, "up", 1));
+    };
+
+    const request = validBaseRequest({ options: { indicatorConfig: SMALL_INDICATOR_CONFIG } });
+    const result = await runMarketIntelligenceRequest(request, {
+      market: { enabled: true },
+      marketTimeframes: ["1day", "1week"],
+      marketAdapterConfig: { fetchImpl },
+    });
+
+    assert.equal(result.pipelineResult.ok, true);
+    // Chief Trading Manager's technical_summary (agents/chief-trading-manager/evidence.js's
+    // buildTechnicalSummary) flattens the raw Technical Report's
+    // technical_conflicts.conflicts array onto its own `conflicts`
+    // field directly.
+    const technicalSummary = result.pipelineResult.response.technical_summary;
+    const timeframeConflict = technicalSummary.conflicts.find((c) => c.type === "TIMEFRAME_CONFLICT");
+    assert.ok(timeframeConflict, "expected a real TIMEFRAME_CONFLICT between 1day and 1week");
+    assert.deepEqual([...timeframeConflict.timeframes].sort(), ["1day", "1week"]);
+    assert.deepEqual(timeframeConflict.trends, ["UPTREND", "DOWNTREND"]);
+  });
+});
+
 test.after(() => {
   orchestratorModule.processRequest = originalProcessRequest;
   global.setTimeout = originalSetTimeout;

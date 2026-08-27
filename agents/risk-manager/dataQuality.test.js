@@ -5,10 +5,10 @@ const { UNKNOWN } = require("../../core/constants");
 
 function baseSetupReport(overrides = {}) {
   return {
-    news_evidence: { conflicts: [] },
-    macro_evidence: { conflicts: [] },
-    technical_evidence: { conflicts: [] },
-    sentiment_evidence: { conflicts: [] },
+    news_evidence: { conflicts: [], warnings: [], items: [] },
+    macro_evidence: { conflicts: [], warnings: [], items: [] },
+    technical_evidence: { conflicts: [], warnings: [], items: [] },
+    sentiment_evidence: { conflicts: [], warnings: [], items: [] },
     conflicting_evidence: [],
     setup_quality: "HIGH",
     uncertainties: [],
@@ -17,23 +17,82 @@ function baseSetupReport(overrides = {}) {
   };
 }
 
-test("assessDataQuality detects a STALE mention in uncertainties", () => {
-  const report = baseSetupReport({ uncertainties: ["BTC data from source-A is STALE DATA."] });
+function staleWarning(message = "BTC data from source-A is STALE DATA.") {
+  return { ok: false, code: "STALE_DATA", message, details: {} };
+}
+
+// Step 101: stale/unverified detection reads structured fields
+// (a failSafe() object's `.code`, or a record's own verification_status/
+// freshness_status) — never an uncertainty/warning's message text.
+
+test("1. stale data produces staleCount > 0 (and the stale boolean, from a structured STALE_DATA warning, not text)", () => {
+  const report = baseSetupReport({ macro_evidence: { conflicts: [], warnings: [staleWarning()], items: [] } });
   const result = assessDataQuality({ tradeSetupReport: report, macroReport: null, technicalReport: null });
   assert.equal(result.stale, true);
+  assert.ok(result.staleCount > 0);
 });
 
-test("assessDataQuality detects an UNVERIFIED mention in warnings", () => {
+test("2. unverified data produces unverifiedCount > 0 (and the unverified boolean, from a record's verification_status, not text)", () => {
+  const report = baseSetupReport({
+    news_evidence: { conflicts: [], warnings: [], items: [{ headline: "x", verification_status: "UNVERIFIED" }] },
+  });
+  const result = assessDataQuality({ tradeSetupReport: report, macroReport: null, technicalReport: null });
+  assert.equal(result.unverified, true);
+  assert.ok(result.unverifiedCount > 0);
+});
+
+test("assessDataQuality does NOT flag stale from a plain-string warning merely mentioning STALE — message text is never the source of truth", () => {
+  const report = baseSetupReport({ warnings: ["BTC data from source-A is STALE DATA."] });
+  const result = assessDataQuality({ tradeSetupReport: report, macroReport: null, technicalReport: null });
+  assert.equal(result.stale, false);
+  assert.equal(result.staleCount, 0);
+});
+
+test("assessDataQuality does NOT flag unverified from a plain-string warning merely mentioning UNVERIFIED — message text is never the source of truth", () => {
   const report = baseSetupReport({ warnings: ["Source not supplied — verification cannot be established (NOT_AVAILABLE)."] });
   const result = assessDataQuality({ tradeSetupReport: report, macroReport: null, technicalReport: null });
-  // This particular warning doesn't literally say UNVERIFIED, so confirm it does NOT falsely flag.
   assert.equal(result.unverified, false);
+  assert.equal(result.unverifiedCount, 0);
+});
+
+test("5. changing a STALE_DATA warning's message wording does not break stale detection", () => {
+  const reworded = baseSetupReport({
+    macro_evidence: { conflicts: [], warnings: [staleWarning("A totally different phrasing with no trigger word.")], items: [] },
+  });
+  const result = assessDataQuality({ tradeSetupReport: reworded, macroReport: null, technicalReport: null });
+  assert.equal(result.stale, true);
+  assert.ok(result.staleCount > 0);
 });
 
 test("assessDataQuality lists missing domains by name, never guesses they exist", () => {
   const report = baseSetupReport({ news_evidence: null, sentiment_evidence: null });
   const result = assessDataQuality({ tradeSetupReport: report, macroReport: null, technicalReport: null });
   assert.deepEqual(result.missing_information, ["news", "sentiment"]);
+});
+
+test("3. missing data is represented structurally as missingCount, matching missing_information.length", () => {
+  const report = baseSetupReport({ news_evidence: null, sentiment_evidence: null });
+  const result = assessDataQuality({ tradeSetupReport: report, macroReport: null, technicalReport: null });
+  assert.equal(result.missingCount, 2);
+  assert.equal(result.missingCount, result.missing_information.length);
+
+  const complete = assessDataQuality({ tradeSetupReport: baseSetupReport(), macroReport: null, technicalReport: null });
+  assert.equal(complete.missingCount, 0);
+});
+
+test("structured quality object exposes freshnessStatus and qualityStatus using existing project terminology", () => {
+  const clean = assessDataQuality({ tradeSetupReport: baseSetupReport(), macroReport: null, technicalReport: null });
+  assert.equal(clean.freshnessStatus, "UNKNOWN"); // no freshness signal observed at all — honest, not guessed FRESH
+  assert.equal(clean.qualityStatus, "HIGH");
+
+  const stale = assessDataQuality(
+    { tradeSetupReport: baseSetupReport({ macro_evidence: { conflicts: [], warnings: [staleWarning()], items: [] } }), macroReport: null, technicalReport: null }
+  );
+  assert.equal(stale.freshnessStatus, "STALE");
+  assert.equal(stale.qualityStatus, "LOW");
+
+  const missingOnly = assessDataQuality({ tradeSetupReport: baseSetupReport({ news_evidence: null }), macroReport: null, technicalReport: null });
+  assert.equal(missingOnly.qualityStatus, "MEDIUM");
 });
 
 test("assessDataQuality flags weak_setup_evidence for LOW or UNKNOWN setup quality", () => {

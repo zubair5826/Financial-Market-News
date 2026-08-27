@@ -6,7 +6,63 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 const { runApplicationRequest } = require("./app");
+const { FRESHNESS_POLICY, getFreshnessThresholds } = require("./config/freshness");
+
+// Step 102: a throwaway temp path so these tests never append to the
+// real data/runs.jsonl. Passed via options.runStore.filePath — see
+// app.js/data/runStore.js.
+function tempRunsFile() {
+  return path.join(os.tmpdir(), `app-test-runs-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`);
+}
+function readJsonlLines(filePath) {
+  return fs
+    .readFileSync(filePath, "utf8")
+    .split("\n")
+    .filter((line) => line.length > 0)
+    .map((line) => JSON.parse(line));
+}
+function cleanupFile(filePath) {
+  try {
+    fs.unlinkSync(filePath);
+  } catch {
+    // Already absent.
+  }
+}
+
+// Every pre-existing (pre-Step-102) test below calls
+// runApplicationRequest() without caring about persistence at all — a
+// single shared temp path keeps every one of those calls off the real
+// data/runs.jsonl too, cleaned up once when this file's tests finish.
+const SHARED_TEST_RUNS_FILE = tempRunsFile();
+test.after(() => cleanupFile(SHARED_TEST_RUNS_FILE));
+function withRunStore(options = {}) {
+  return { ...options, runStore: { filePath: SHARED_TEST_RUNS_FILE } };
+}
+
+function isoDaysAgo(days) {
+  return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+}
+function macroRecord(overrides = {}) {
+  return {
+    indicator: "Test Indicator",
+    indicator_code: "TEST",
+    country: "US",
+    region: "North America",
+    currency: "USD",
+    category: "INFLATION",
+    actual_value: 5,
+    unit: "%",
+    period: "2026-07",
+    source: "test-source",
+    source_type: "official-release",
+    classification: "FACT",
+    ...overrides,
+  };
+}
 
 const SYNTHETIC_KEY = "SYNTHETIC_KEY";
 
@@ -75,9 +131,13 @@ test("1. app.js can be imported and exposes runApplicationRequest as a function"
 // 2 & 4. FRED disabled (default): request reaches the pipeline via
 // runFredAwareRequest(), no network, contract shape is exact.
 test("2/4. FRED disabled by default: request reaches the pipeline, contract is {pipelineResult, fredDiagnostics}, fredDiagnostics is null", async () => {
-  const { value: result, networkCalled } = await withNetworkGuard(async () => runApplicationRequest(validBaseRequest()));
+  const { value: result, networkCalled } = await withNetworkGuard(async () => runApplicationRequest(validBaseRequest(), withRunStore()));
   assert.equal(networkCalled, false);
-  assert.deepEqual(Object.keys(result).sort(), ["fredDiagnostics", "pipelineResult"]);
+  // Step 102: the contract gained one new, additive field —
+  // `persistence` — reporting the outcome of writing this run to
+  // data/runs.jsonl. pipelineResult/fredDiagnostics themselves are
+  // untouched.
+  assert.deepEqual(Object.keys(result).sort(), ["fredDiagnostics", "persistence", "pipelineResult"]);
   assert.equal(result.pipelineResult.ok, true);
   assert.equal(result.fredDiagnostics, null);
 });
@@ -88,20 +148,23 @@ test("3/5. FRED enabled via synthetic fetchImpl: exactly two mock calls, no real
   await withEnvKey(SYNTHETIC_KEY, async () => {
     const calls = [];
     const { value: result, networkCalled } = await withNetworkGuard(async () =>
-      runApplicationRequest(validBaseRequest(), {
-        macro: { enabled: true },
-        adapterConfig: {
-          fetchImpl: makeMockFetch({
-            onCall: (url) => calls.push(url),
-            metadata: jsonResponse(200, seriesMetadataBody()),
-            observations: jsonResponse(200, observationsBody(singleObservation)),
-          }),
-        },
-      })
+      runApplicationRequest(
+        validBaseRequest(),
+        withRunStore({
+          macro: { enabled: true },
+          adapterConfig: {
+            fetchImpl: makeMockFetch({
+              onCall: (url) => calls.push(url),
+              metadata: jsonResponse(200, seriesMetadataBody()),
+              observations: jsonResponse(200, observationsBody(singleObservation)),
+            }),
+          },
+        })
+      )
     );
     assert.equal(networkCalled, false);
     assert.equal(calls.length, 2); // proves the pipeline ran exactly once, not duplicated
-    assert.deepEqual(Object.keys(result).sort(), ["fredDiagnostics", "pipelineResult"]);
+    assert.deepEqual(Object.keys(result).sort(), ["fredDiagnostics", "persistence", "pipelineResult"]);
     assert.equal(result.pipelineResult.ok, true);
     assert.equal(result.pipelineResult.pipeline_summary.macro_status, "OK");
     assert.ok(result.fredDiagnostics);
@@ -114,15 +177,18 @@ test("6. the caller's request object is not mutated", async () => {
   await withEnvKey(SYNTHETIC_KEY, async () => {
     const request = validBaseRequest();
     const snapshot = JSON.parse(JSON.stringify(request));
-    await runApplicationRequest(request, {
-      macro: { enabled: true },
-      adapterConfig: {
-        fetchImpl: makeMockFetch({
-          metadata: jsonResponse(200, seriesMetadataBody()),
-          observations: jsonResponse(200, observationsBody(singleObservation)),
-        }),
-      },
-    });
+    await runApplicationRequest(
+      request,
+      withRunStore({
+        macro: { enabled: true },
+        adapterConfig: {
+          fetchImpl: makeMockFetch({
+            metadata: jsonResponse(200, seriesMetadataBody()),
+            observations: jsonResponse(200, observationsBody(singleObservation)),
+          }),
+        },
+      })
+    );
     assert.deepEqual(request, snapshot);
   });
 });
@@ -135,16 +201,19 @@ test("6. the caller's request object is not mutated", async () => {
 test("7. the entrypoint does not duplicate pipeline processing", async () => {
   await withEnvKey(SYNTHETIC_KEY, async () => {
     const calls = [];
-    const result = await runApplicationRequest(validBaseRequest(), {
-      macro: { enabled: true },
-      adapterConfig: {
-        fetchImpl: makeMockFetch({
-          onCall: (url) => calls.push(url),
-          metadata: jsonResponse(200, seriesMetadataBody()),
-          observations: jsonResponse(200, observationsBody(singleObservation)),
-        }),
-      },
-    });
+    const result = await runApplicationRequest(
+      validBaseRequest(),
+      withRunStore({
+        macro: { enabled: true },
+        adapterConfig: {
+          fetchImpl: makeMockFetch({
+            onCall: (url) => calls.push(url),
+            metadata: jsonResponse(200, seriesMetadataBody()),
+            observations: jsonResponse(200, observationsBody(singleObservation)),
+          }),
+        },
+      })
+    );
     assert.equal(calls.length, 2); // one metadata + one observations call — not four
     assert.equal(result.fredDiagnostics.seriesResults.length, 1);
   });
@@ -153,15 +222,18 @@ test("7. the entrypoint does not duplicate pipeline processing", async () => {
 // 8. No credential exposure anywhere in the returned structure.
 test("8. the synthetic credential never appears anywhere in the returned structure", async () => {
   await withEnvKey(SYNTHETIC_KEY, async () => {
-    const result = await runApplicationRequest(validBaseRequest(), {
-      macro: { enabled: true },
-      adapterConfig: {
-        fetchImpl: makeMockFetch({
-          metadata: jsonResponse(200, seriesMetadataBody()),
-          observations: jsonResponse(200, observationsBody(singleObservation)),
-        }),
-      },
-    });
+    const result = await runApplicationRequest(
+      validBaseRequest(),
+      withRunStore({
+        macro: { enabled: true },
+        adapterConfig: {
+          fetchImpl: makeMockFetch({
+            metadata: jsonResponse(200, seriesMetadataBody()),
+            observations: jsonResponse(200, observationsBody(singleObservation)),
+          }),
+        },
+      })
+    );
     assert.ok(!JSON.stringify(result).includes(SYNTHETIC_KEY));
   });
 });
@@ -172,7 +244,232 @@ test("8. the synthetic credential never appears anywhere in the returned structu
 test("9. existing behavior remains intact: caller-supplied macroData passes through unchanged when FRED is disabled", async () => {
   const callerRecord = { indicator: "Caller Supplied", classification: "FACT" };
   const request = validBaseRequest({ macroData: [callerRecord] });
-  const result = await runApplicationRequest(request, { macro: { enabled: false } });
+  const result = await runApplicationRequest(request, withRunStore({ macro: { enabled: false } }));
   assert.equal(result.fredDiagnostics, null);
   assert.equal(result.pipelineResult.pipeline_summary.macro_status, "OK");
+});
+
+// --- Step 100: centralized freshness policy wiring ---
+
+// 9/10 (Step 100 requirement list). Every production entrypoint uses
+// the centralized configuration: omitting freshnessThresholds entirely
+// must no longer silently leave freshness UNKNOWN — it now defaults to
+// the exact FRESHNESS_POLICY.macro object.
+test("100-1. omitting options.freshnessThresholds still evaluates a caller-supplied macro record's freshness against the centralized macro policy", async () => {
+  const freshRecord = macroRecord({ release_timestamp: isoDaysAgo(1) }); // fresh under the 30-day macro window
+  const staleRecord = macroRecord({ indicator: "Stale Test Indicator", release_timestamp: isoDaysAgo(200) }); // stale under the 120-day macro window
+
+  const freshResult = await runApplicationRequest(validBaseRequest({ macroData: [freshRecord] }), withRunStore());
+  const staleResult = await runApplicationRequest(validBaseRequest({ macroData: [staleRecord] }), withRunStore());
+
+  assert.equal(freshResult.pipelineResult.ok, true);
+  assert.equal(staleResult.pipelineResult.ok, true);
+  // The stale record's own presence must be visible in the response as
+  // a STALE-mentioning signal somewhere (warnings and/or the Chief
+  // Trading Manager report) — never silently treated the same as fresh
+  // data, and never UNKNOWN merely because no threshold was supplied.
+  const staleMentioned = JSON.stringify(staleResult.pipelineResult).includes("STALE");
+  const freshMentionsStale = JSON.stringify(freshResult.pipelineResult).includes('"STALE"');
+  assert.ok(staleMentioned, "a 200-day-old macro record must surface a STALE signal now that a real threshold is applied by default");
+  assert.ok(!freshMentionsStale, "a 1-day-old macro record must never be reported as STALE");
+});
+
+// An explicit caller-supplied freshnessThresholds value is never
+// overridden by the centralized default. NOTE: the threshold lives on
+// request.options.freshnessThresholds (what processRequest() actually
+// reads), not on this function's own second `options` parameter (that
+// one only controls this entrypoint's FRED-wiring, e.g.
+// options.macro.enabled) — see the Step 100 comment in app.js.
+test("100-2. an explicit request.options.freshnessThresholds is preserved, never replaced by the centralized default", async () => {
+  // A deliberately tiny custom threshold — if the default silently won
+  // instead, a 2-day-old record would incorrectly read FRESH under the
+  // real 30-day macro default; with the caller's own 1-hour window
+  // honored, it must read STALE.
+  const tinyThreshold = { freshMaxMs: 60 * 1000, agingMaxMs: 60 * 60 * 1000 };
+  const record = macroRecord({ release_timestamp: isoDaysAgo(2) });
+  const request = validBaseRequest({ macroData: [record], options: { freshnessThresholds: tinyThreshold } });
+  const result = await runApplicationRequest(request, withRunStore());
+  assert.ok(JSON.stringify(result.pipelineResult).includes("STALE_DATA"));
+});
+
+// Stale status reaching the Risk Manager: runRiskManager() (see
+// orchestrator/index.js's sendToRiskManager()) receives the raw
+// macroReport — containing the STALE_DATA warning the fix above now
+// makes computable at all — as one of its own direct inputs, and the
+// pipeline's final top-level `warnings` (assembled after Risk Manager
+// runs) carries that same signal through to the caller.
+//
+// Disclosed, pre-existing, out-of-scope limitation found while writing
+// this test: escalating this into the Risk Manager's own TIMING_RISK
+// *category* does not currently happen for ANY domain (verified: both
+// agents/macro-agent/index.js and agents/news-agent/index.js push
+// STALE_DATA only into their report's `warnings` array, never
+// `uncertainties`; agents/trade-setup-agent/index.js's evidence
+// aggregation forwards only `uncertainties` between agents — see
+// agents/trade-setup-agent/evidence.js). Fixing that would mean
+// changing cross-agent aggregation logic in the Trade Setup Agent,
+// which is a pipeline change, not a freshness-configuration one, and
+// is explicitly out of this step's scope ("do not redesign the
+// intelligence pipeline"). This test verifies the real, current
+// behavior, not an assumed one.
+test("100-3. a stale macro record (centralized default policy) reaches the Risk Manager's own input and the final pipeline warnings", async () => {
+  const staleRecord = macroRecord({ release_timestamp: isoDaysAgo(200) });
+  const result = await runApplicationRequest(validBaseRequest({ macroData: [staleRecord] }), withRunStore());
+  // The Risk Manager's own report is present (it ran, using macroReport
+  // as one of its real inputs) and the STALE_DATA signal reaches the
+  // final, top-level response the caller actually receives.
+  assert.ok(result.pipelineResult.response.risk_summary);
+  assert.ok(
+    result.pipelineResult.warnings.some((w) => (typeof w === "string" ? w.includes("STALE") : w && w.code === "STALE_DATA")),
+    "the STALE_DATA signal must reach the final top-level pipeline response"
+  );
+});
+
+// The centralized policy object itself — not a duplicated copy — is
+// what flows through, confirmed by identity against config/freshness.js.
+test("100-4. the exact FRESHNESS_POLICY.macro object (not a re-derived copy) is what a caller retrieves for this entrypoint's domain", () => {
+  assert.equal(getFreshnessThresholds("macro"), FRESHNESS_POLICY.macro);
+});
+
+// --- Step 102: persistent run store, wired through app.js ---
+
+test("102-1. a successful run is persisted to the run store with a matching run_id", async () => {
+  const filePath = tempRunsFile();
+  try {
+    const result = await runApplicationRequest(validBaseRequest(), { runStore: { filePath } });
+    assert.equal(result.persistence.status, "PERSISTED");
+    assert.ok(result.persistence.run_id);
+
+    const lines = readJsonlLines(filePath);
+    assert.equal(lines.length, 1);
+    assert.equal(lines[0].run_id, result.persistence.run_id);
+  } finally {
+    cleanupFile(filePath);
+  }
+});
+
+test("102-2. two separate runs receive unique run IDs end to end", async () => {
+  const filePath = tempRunsFile();
+  try {
+    const first = await runApplicationRequest(validBaseRequest(), { runStore: { filePath } });
+    const second = await runApplicationRequest(validBaseRequest(), { runStore: { filePath } });
+    assert.notEqual(first.persistence.run_id, second.persistence.run_id);
+  } finally {
+    cleanupFile(filePath);
+  }
+});
+
+test("102-3. persisted records are valid JSONL — one independently parseable JSON object per line", async () => {
+  const filePath = tempRunsFile();
+  try {
+    await runApplicationRequest(validBaseRequest(), { runStore: { filePath } });
+    await runApplicationRequest(validBaseRequest(), { runStore: { filePath } });
+    const raw = fs.readFileSync(filePath, "utf8");
+    const lines = raw.split("\n").filter((l) => l.length > 0);
+    assert.equal(lines.length, 2);
+    for (const line of lines) {
+      assert.doesNotThrow(() => JSON.parse(line));
+    }
+  } finally {
+    cleanupFile(filePath);
+  }
+});
+
+test("102-4. multiple runs append correctly across separate calls, none overwritten", async () => {
+  const filePath = tempRunsFile();
+  try {
+    await runApplicationRequest(validBaseRequest({ asset: "BTC" }), { runStore: { filePath } });
+    await runApplicationRequest(validBaseRequest({ asset: "ETH" }), { runStore: { filePath } });
+    await runApplicationRequest(validBaseRequest({ asset: "US" }), { runStore: { filePath } });
+    const lines = readJsonlLines(filePath);
+    assert.equal(lines.length, 3);
+    assert.deepEqual(lines.map((l) => l.requested_instrument), ["BTC", "ETH", "US"]);
+  } finally {
+    cleanupFile(filePath);
+  }
+});
+
+test("102-5. the stored record contains every field required by the Step 102 spec", async () => {
+  const filePath = tempRunsFile();
+  try {
+    await runApplicationRequest(validBaseRequest(), { runStore: { filePath } });
+    const [record] = readJsonlLines(filePath);
+    for (const field of [
+      "run_id",
+      "timestamp",
+      "requested_instrument",
+      "original_request",
+      "normalized_request",
+      "provider_diagnostics",
+      "freshness_status",
+      "data_quality_status",
+      "agent_outputs",
+      "risk_manager_result",
+      "chief_trading_manager_result",
+      "final_decision",
+      "confidence",
+      "warnings",
+      "errors",
+    ]) {
+      assert.ok(Object.prototype.hasOwnProperty.call(record, field), `missing field: ${field}`);
+    }
+    assert.equal(record.requested_instrument, "US");
+    assert.ok(record.risk_manager_result);
+    assert.ok(record.chief_trading_manager_result);
+  } finally {
+    cleanupFile(filePath);
+  }
+});
+
+test("102-6. no secrets are stored — a credential-shaped field anywhere in the request is redacted end to end", async () => {
+  const filePath = tempRunsFile();
+  try {
+    const request = validBaseRequest({ options: { adapterConfig: { apiKey: "sk-should-never-be-persisted" } } });
+    await runApplicationRequest(request, { runStore: { filePath } });
+    const raw = fs.readFileSync(filePath, "utf8");
+    assert.ok(!raw.includes("sk-should-never-be-persisted"));
+  } finally {
+    cleanupFile(filePath);
+  }
+});
+
+test("102-7. a persistence failure is handled safely — the request still succeeds, with a FAILED persistence outcome, never a thrown error", async () => {
+  const blockerFile = tempRunsFile();
+  fs.writeFileSync(blockerFile, "not a directory");
+  const impossiblePath = path.join(blockerFile, "runs.jsonl");
+  try {
+    const result = await runApplicationRequest(validBaseRequest(), { runStore: { filePath: impossiblePath } });
+    assert.equal(result.pipelineResult.ok, true);
+    assert.equal(result.persistence.status, "FAILED");
+    assert.ok(result.persistence.error);
+  } finally {
+    cleanupFile(blockerFile);
+  }
+});
+
+test("102-8. the intelligence decision itself is identical whether persistence succeeds or fails", async () => {
+  const goodFilePath = tempRunsFile();
+  const blockerFile = tempRunsFile();
+  fs.writeFileSync(blockerFile, "not a directory");
+  const badFilePath = path.join(blockerFile, "runs.jsonl");
+  try {
+    const withSuccess = await runApplicationRequest(validBaseRequest(), { runStore: { filePath: goodFilePath } });
+    const withFailure = await runApplicationRequest(validBaseRequest(), { runStore: { filePath: badFilePath } });
+    // Compare the actual decision content, not a byte-for-byte object
+    // (every report layer stamps its own fresh `timestamp` per call —
+    // that varies between any two calls regardless of persistence, and
+    // is not part of "the intelligence decision itself").
+    assert.equal(withSuccess.pipelineResult.ok, withFailure.pipelineResult.ok);
+    assert.equal(withSuccess.pipelineResult.asset, withFailure.pipelineResult.asset);
+    assert.deepEqual(withSuccess.pipelineResult.pipeline_summary, withFailure.pipelineResult.pipeline_summary);
+    assert.deepEqual(withSuccess.pipelineResult.warnings, withFailure.pipelineResult.warnings);
+    assert.deepEqual(withSuccess.pipelineResult.errors, withFailure.pipelineResult.errors);
+    assert.equal(withSuccess.pipelineResult.response.final_assessment, withFailure.pipelineResult.response.final_assessment);
+    assert.equal(withSuccess.pipelineResult.response.decision_status, withFailure.pipelineResult.response.decision_status);
+    assert.equal(withSuccess.pipelineResult.response.risk_summary.risk_decision, withFailure.pipelineResult.response.risk_summary.risk_decision);
+    assert.notEqual(withSuccess.persistence.status, withFailure.persistence.status);
+  } finally {
+    cleanupFile(goodFilePath);
+    cleanupFile(blockerFile);
+  }
 });

@@ -5,8 +5,14 @@
 # Dependencies
 node_modules/
 
-# Runtime logs
+# Runtime logs, including rotated generations (Step 104: system.log.1,
+# system.log.2, ...).
 logs/*.log
+logs/*.log.*
+
+# Persisted intelligence run records (Step 102) — runtime-generated,
+# never source.
+data/runs.jsonl
 
 # OS/editor cruft.
 .DS_Store

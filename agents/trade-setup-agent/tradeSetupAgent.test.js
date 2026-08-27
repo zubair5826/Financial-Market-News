@@ -252,9 +252,16 @@ test("16. report confidence is LOW when conflicting_evidence is non-empty, HIGH 
 });
 
 // 17. Stale input handling.
-test("17. a domain reporting STALE data in its uncertainties results in a TIMING_RISK flag", () => {
+// Step 101: TIMING_RISK is read from the domain report's structured
+// STALE_DATA warning object (failSafe()'s `.code`), never from an
+// uncertainty's message text — this fixture mirrors exactly what
+// news-agent/index.js itself pushes into `warnings` for a real STALE
+// record.
+test("17. a domain reporting a structured STALE_DATA warning results in a TIMING_RISK flag", () => {
   const inputs = allBullishInputs();
-  inputs.newsReport = newsReport({ uncertainties: ['"Fed holds rates" from source-A is STALE DATA.'] });
+  inputs.newsReport = newsReport({
+    warnings: [{ ok: false, code: "STALE_DATA", message: '"Fed holds rates" from source-A is STALE DATA.', details: {} }],
+  });
   const result = processTradeSetup(inputs);
   assert.ok(result.setup_risks.includes("TIMING_RISK"));
 });

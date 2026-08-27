@@ -138,3 +138,58 @@ test("7. the caller's options object is not mutated", async () => {
     assert.deepEqual(Object.keys(options), ["adapterConfig"]);
   });
 });
+
+// --- Step 99: requested-symbol pass-through and relevance verification ---
+
+// 1/10. No symbol option -> SPY default preserved (existing behavior unchanged).
+test("99-1. omitting options.symbol still requests tickers=SPY, unchanged", async () => {
+  await withEnvKey(SYNTHETIC_KEY, async () => {
+    const calls = [];
+    await loadLiveNewsData({ adapterConfig: { fetchImpl: makeMockFetch({ body: feedBody([sampleItem()]), onCall: (u) => calls.push(u) }) } });
+    assert.ok(calls[0].includes("tickers=SPY"));
+  });
+});
+
+// 2. An explicit symbol flows through to the actual request.
+test("99-2. options.symbol='BTC' requests tickers=BTC, not SPY", async () => {
+  await withEnvKey(SYNTHETIC_KEY, async () => {
+    const calls = [];
+    const btcItem = sampleItem({
+      title: "BTC rallies on ETF inflows",
+      ticker_sentiment: [{ ticker: "BTC", relevance_score: "0.9", ticker_sentiment_score: "0.4", ticker_sentiment_label: "Bullish" }],
+    });
+    await loadLiveNewsData({
+      symbol: "BTC",
+      adapterConfig: { fetchImpl: makeMockFetch({ body: feedBody([btcItem]), onCall: (u) => calls.push(u) }) },
+    });
+    assert.ok(calls[0].includes("tickers=BTC"));
+  });
+});
+
+// 7. News symbol mismatch -> rejected, never silently attributed to the requested symbol.
+test("99-3. a feed tagged entirely for a different ticker than requested is rejected, never returned as BTC data", async () => {
+  await withEnvKey(SYNTHETIC_KEY, async () => {
+    const spyOnlyItem = sampleItem(); // tagged SPY only
+    const result = await loadLiveNewsData({
+      symbol: "BTC",
+      adapterConfig: { fetchImpl: makeMockFetch({ body: feedBody([spyOnlyItem]) }) },
+    });
+    assert.deepEqual(result.newsData, []);
+    assert.equal(result.providerResult.ok, false);
+    assert.equal(result.providerResult.code, "INVALID_RESPONSE");
+  });
+});
+
+// Untagged records (no ticker_sentiment at all) are never treated as a
+// mismatch by omission — a legitimately quiet/untagged feed is not an error.
+test("99-4. a feed with no ticker_sentiment tagging at all is accepted, not treated as a mismatch", async () => {
+  await withEnvKey(SYNTHETIC_KEY, async () => {
+    const untaggedItem = sampleItem({ ticker_sentiment: [] });
+    const result = await loadLiveNewsData({
+      symbol: "BTC",
+      adapterConfig: { fetchImpl: makeMockFetch({ body: feedBody([untaggedItem]) }) },
+    });
+    assert.equal(result.providerResult.ok, true);
+    assert.equal(result.newsData.length, 1);
+  });
+});

@@ -83,11 +83,54 @@ test("missing setup: no trade setup reference returns UNKNOWN risk and INSUFFICI
 });
 
 // 3. Stale data.
-test("stale data: a STALE mention in the setup's uncertainties flags TIMING_RISK", () => {
-  const setup = tradeSetupReport({ uncertainties: ['"CPI" from source-A is STALE DATA.'] });
+// Step 101: TIMING_RISK is driven by the structured
+// { code: "STALE_DATA" } warning object a domain evidence already
+// carries (never by scanning uncertainty/warning message text) — this
+// mirrors exactly what macro-agent/news-agent push into their own
+// `warnings` for a real STALE record.
+test("stale data: a structured STALE_DATA warning on a domain report flags TIMING_RISK", () => {
+  const setup = tradeSetupReport({
+    macro_evidence: {
+      domain: "MACRO",
+      bias: "BULLISH",
+      confidence: "HIGH",
+      conflicts: [],
+      uncertainties: [],
+      warnings: [{ ok: false, code: "STALE_DATA", message: '"CPI" from source-A is STALE DATA.', details: {} }],
+      items: [],
+      sources: ["macro-A"],
+    },
+  });
   const result = processRiskAssessment({ tradeSetupReport: setup });
   assert.ok(result.risk_categories.includes("TIMING_RISK"));
   assert.equal(result.data_quality.stale, true);
+  assert.ok(result.data_quality.staleCount > 0);
+});
+
+// 5. Robustness to wording changes (Step 101 requirement 5).
+test("changing the STALE_DATA warning's message wording does not break TIMING_RISK detection", () => {
+  const setup = tradeSetupReport({
+    macro_evidence: {
+      domain: "MACRO",
+      bias: "BULLISH",
+      confidence: "HIGH",
+      conflicts: [],
+      uncertainties: [],
+      warnings: [{ ok: false, code: "STALE_DATA", message: "A brand new phrasing that says nothing about freshness at all.", details: {} }],
+      items: [],
+      sources: ["macro-A"],
+    },
+  });
+  const result = processRiskAssessment({ tradeSetupReport: setup });
+  assert.ok(result.risk_categories.includes("TIMING_RISK"));
+  assert.equal(result.data_quality.stale, true);
+});
+
+test("a plain-string warning merely mentioning STALE does NOT flag TIMING_RISK — message text is never the source of truth", () => {
+  const setup = tradeSetupReport({ uncertainties: ['"CPI" from source-A is STALE DATA.'] });
+  const result = processRiskAssessment({ tradeSetupReport: setup });
+  assert.equal(result.risk_categories.includes("TIMING_RISK"), false);
+  assert.equal(result.data_quality.stale, false);
 });
 
 // 4. Conflicting data.
@@ -148,11 +191,32 @@ test("major event risk is UNKNOWN, not assumed false, without a configured windo
 });
 
 // 10. Unverified source.
-test("unverified source: an UNVERIFIED mention in the setup's uncertainties flags DATA_RISK", () => {
-  const setup = tradeSetupReport({ uncertainties: ["BTC sentiment from source-A: UNVERIFIED."] });
+// Step 101: unverified detection reads a record's own
+// verification_status (core/verification.js's SOURCE_VERIFICATION_STATES),
+// never the wording of an uncertainty string.
+test("unverified source: a record with verification_status UNVERIFIED flags DATA_RISK", () => {
+  const setup = tradeSetupReport({
+    sentiment_evidence: {
+      domain: "SENTIMENT",
+      bias: "BULLISH",
+      confidence: "HIGH",
+      conflicts: [],
+      uncertainties: [],
+      warnings: [],
+      items: [{ sentiment: "BULLISH", source: "source-A", verification_status: "UNVERIFIED" }],
+      sources: ["sent-A"],
+    },
+  });
   const result = processRiskAssessment({ tradeSetupReport: setup });
   assert.equal(result.data_quality.unverified, true);
+  assert.ok(result.data_quality.unverifiedCount > 0);
   assert.ok(result.risk_categories.includes("DATA_RISK"));
+});
+
+test("a plain-string uncertainty merely mentioning UNVERIFIED does NOT flag it — message text is never the source of truth", () => {
+  const setup = tradeSetupReport({ uncertainties: ["BTC sentiment from source-A: UNVERIFIED."] });
+  const result = processRiskAssessment({ tradeSetupReport: setup });
+  assert.equal(result.data_quality.unverified, false);
 });
 
 // 11. Risk escalation.

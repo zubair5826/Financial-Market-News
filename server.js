@@ -1,23 +1,64 @@
-// Minimal Production HTTP API Layer — Step 93. A thin transport wrapper
-// around the existing, unmodified intelligence functions. It adds no new
-// intelligence logic, no new request/response schema beyond what those
-// functions already define, and no new provider behavior — it only
-// receives an HTTP request, parses its JSON body, calls the existing
-// function, and serializes the existing return value verbatim.
+// Minimal Production HTTP API Layer — Step 93, hardened for public
+// deployment in Step 105. A thin transport wrapper around the existing,
+// unmodified intelligence functions. It adds no new intelligence logic,
+// no new request/response schema beyond what those functions already
+// define, and no new provider behavior — it only receives an HTTP
+// request, authenticates/rate-limits it, parses its JSON body, calls
+// the existing function, and serializes the existing return value
+// verbatim.
 //
-// Uses only Node's built-in `http` module — no Express or other
-// framework. This project has zero dependencies today; a framework
-// would be the first one, and nothing here needs more than routing on
-// (method, pathname) and a JSON body, which `http` already provides.
+// Uses only Node's built-in `http`/`crypto` modules — no Express or
+// other framework, no rate-limiting/auth package. This project has
+// zero dependencies today; a framework would be the first one, and
+// nothing here needs more than routing on (method, pathname), a JSON
+// body, a bearer-token check, and an in-memory per-IP counter — all of
+// which Node's standard library already provides.
 //
 // Calls exactly two existing, unmodified functions:
 //   - runApplicationRequest(request, options)  from ./app.js
 //   - runPortfolioIntelligenceRequest(request) from ./portfolioIntelligence.js
 // Neither is reimplemented, extended, or bypassed here.
+//
+// Step 105 — security design:
+//   - Authentication: a single shared secret, API_AUTH_TOKEN, read
+//     from the environment only — never hard-coded, never logged, and
+//     never echoed back in any response (every failure returns the
+//     identical generic `{ error: "Unauthorized" }`, regardless of
+//     whether the header was missing, malformed, wrong, or the server
+//     itself has no token configured at all — a caller can never learn
+//     which case applied). Comparison is length-normalized (both sides
+//     hashed to a fixed-size digest first) and done with
+//     crypto.timingSafeEqual() so response timing can't be used to
+//     guess the token character by character. FAILS CLOSED: if
+//     API_AUTH_TOKEN is unset/blank, every intelligence request is
+//     rejected — a forgotten secret must never silently become an
+//     open API.
+//   - Rate limiting: a basic in-memory fixed-window counter per client
+//     IP (RATE_LIMIT_WINDOW_MS / RATE_LIMIT_MAX_REQUESTS, both
+//     env-configurable with sane defaults), applied to every request
+//     EXCEPT /health, and applied BEFORE route lookup/method/auth
+//     checks — so a client cannot dodge the limiter by hitting an
+//     unknown path, the wrong method, or a malformed body; every one
+//     of those still counts against its IP first. The client IP
+//     prefers X-Forwarded-For's first entry (Railway's own proxy sets
+//     this reliably) and falls back to the raw socket address for
+//     direct/local connections (tests). KNOWN LIMITATION, disclosed
+//     rather than hidden: X-Forwarded-For is caller-suppliable and
+//     only trustworthy when this process truly sits behind a proxy
+//     that overwrites it (as Railway's does) — if this server is ever
+//     exposed directly to the internet without such a proxy in front
+//     of it, that header could be forged to evade per-IP limiting.
+//     "Basic" per the spec, not a defense against a determined
+//     attacker with direct access.
+//   - /health stays completely open (no auth, no rate limit) — Step
+//     105 requirement 1/8 — so Railway's own health checks are never
+//     blocked or throttled by either mechanism.
 
 const http = require("http");
+const crypto = require("crypto");
 const { runApplicationRequest } = require("./app");
 const { runPortfolioIntelligenceRequest } = require("./portfolioIntelligence");
+const { logEvent } = require("./logs/logger");
 
 const PORT = process.env.PORT || 3000;
 
@@ -27,6 +68,114 @@ const PORT = process.env.PORT || 3000;
 // the already-parsed JSON object).
 const MAX_BODY_BYTES = 1024 * 1024; // 1 MiB
 
+// --- Step 105: authentication ---
+
+// Read fresh on every check (never cached at module load) so a token
+// configured/rotated via the environment takes effect without a
+// restart in environments that support live env reloads, and so tests
+// can set/unset process.env.API_AUTH_TOKEN per-case without needing a
+// fresh module load. Blank/whitespace-only counts as "not configured."
+function getConfiguredAuthToken() {
+  const token = process.env.API_AUTH_TOKEN;
+  return typeof token === "string" && token.trim() ? token : null;
+}
+
+function extractBearerToken(req) {
+  const header = req.headers["authorization"];
+  if (typeof header !== "string") return null;
+  const match = header.match(/^Bearer\s+(.+)$/);
+  return match ? match[1].trim() : null;
+}
+
+// Fixed-length-digest comparison: crypto.timingSafeEqual() itself
+// requires equal-length buffers (a raw length mismatch would throw,
+// and handling that specially would leak the correct length through
+// timing/behavior); hashing both sides to the same fixed size first
+// removes that leak entirely and makes the whole check constant-time
+// regardless of the provided token's length.
+function tokensMatch(provided, configured) {
+  const providedDigest = crypto.createHash("sha256").update(String(provided)).digest();
+  const configuredDigest = crypto.createHash("sha256").update(String(configured)).digest();
+  return crypto.timingSafeEqual(providedDigest, configuredDigest);
+}
+
+// True only for a present, well-formed, matching bearer token AND a
+// configured server-side secret. Every failure path is indistinguishable
+// from every other at the call site — callers only ever see a boolean.
+function isAuthorized(req) {
+  const configuredToken = getConfiguredAuthToken();
+  if (!configuredToken) return false;
+  const providedToken = extractBearerToken(req);
+  if (!providedToken) return false;
+  return tokensMatch(providedToken, configuredToken);
+}
+
+// --- Step 105: per-IP rate limiting ---
+
+function readPositiveIntEnv(name, defaultValue) {
+  const parsed = parseInt(process.env[name], 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : defaultValue;
+}
+
+const RATE_LIMIT_WINDOW_MS = readPositiveIntEnv("RATE_LIMIT_WINDOW_MS", 60_000); // 1 minute
+const RATE_LIMIT_MAX_REQUESTS = readPositiveIntEnv("RATE_LIMIT_MAX_REQUESTS", 30); // 30 requests/IP/window
+
+// ip -> { count, windowStart }. Each entry self-expires the next time
+// that IP is seen after its window has passed; a periodic sweep
+// (below) additionally reclaims memory from IPs never seen again, so
+// this can't grow without bound over a long-running process.
+const rateLimitBuckets = new Map();
+
+function getClientIp(req) {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (typeof forwarded === "string" && forwarded.trim()) {
+    return forwarded.split(",")[0].trim();
+  }
+  return (req.socket && req.socket.remoteAddress) || "unknown";
+}
+
+// Returns { limited, retryAfterSeconds }. A window is a fixed
+// (non-sliding) RATE_LIMIT_WINDOW_MS bucket per IP — simple and
+// dependency-free, appropriate for "basic" per-spec rate limiting; a
+// client could in principle send a burst straddling two windows, a
+// known, accepted trade-off of the simplest correct fixed-window
+// design over a sliding one.
+function checkRateLimit(ip) {
+  const now = Date.now();
+  const bucket = rateLimitBuckets.get(ip);
+  if (!bucket || now - bucket.windowStart >= RATE_LIMIT_WINDOW_MS) {
+    rateLimitBuckets.set(ip, { count: 1, windowStart: now });
+    return { limited: false };
+  }
+  bucket.count += 1;
+  if (bucket.count > RATE_LIMIT_MAX_REQUESTS) {
+    const retryAfterSeconds = Math.max(1, Math.ceil((bucket.windowStart + RATE_LIMIT_WINDOW_MS - now) / 1000));
+    return { limited: true, retryAfterSeconds };
+  }
+  return { limited: false };
+}
+
+// Bounds total memory across many distinct IPs over time; not needed
+// for correctness (each bucket already self-expires on next use).
+// unref()'d so it never keeps the process — or a test — alive.
+const rateLimitSweepInterval = setInterval(() => {
+  const now = Date.now();
+  for (const [ip, bucket] of rateLimitBuckets) {
+    if (now - bucket.windowStart >= RATE_LIMIT_WINDOW_MS) rateLimitBuckets.delete(ip);
+  }
+}, RATE_LIMIT_WINDOW_MS);
+rateLimitSweepInterval.unref();
+
+// Step 104: one operational log line per HTTP request/response, coarse
+// enough to stay genuinely useful without needing a taxonomy of HTTP
+// error codes — SUCCESS covers 2xx/3xx, the rest split only on whether
+// the caller or this server is at fault.
+function classifyOutcome(statusCode) {
+  if (statusCode >= 500) return "SERVER_ERROR";
+  if (statusCode >= 400) return "CLIENT_ERROR";
+  return "SUCCESS";
+}
+
 function sendJson(res, statusCode, payload) {
   const body = JSON.stringify(payload);
   res.writeHead(statusCode, {
@@ -34,6 +183,13 @@ function sendJson(res, statusCode, payload) {
     "Content-Length": Buffer.byteLength(body),
   });
   res.end(body);
+  // Stashed only so requestListener's single logging hook (below) can
+  // read the run_id a successful /api/intelligence response already
+  // carries (result.persistence.run_id, Step 102) — never re-sent,
+  // never logged as the full payload itself (that could be large and
+  // would just re-embed whatever the caller's own request/response
+  // already contains).
+  res.__loggedPayload = payload;
 }
 
 // Reads and JSON-parses a request body, enforcing MAX_BODY_BYTES.
@@ -115,6 +271,9 @@ async function handleIntelligence(req, res) {
   if (req.method !== "POST") {
     return sendJson(res, 405, { error: "Method Not Allowed", allowed: ["POST"] });
   }
+  if (!isAuthorized(req)) {
+    return sendJson(res, 401, { error: "Unauthorized" });
+  }
 
   let body;
   try {
@@ -146,6 +305,9 @@ async function handlePortfolioIntelligence(req, res) {
   if (req.method !== "POST") {
     return sendJson(res, 405, { error: "Method Not Allowed", allowed: ["POST"] });
   }
+  if (!isAuthorized(req)) {
+    return sendJson(res, 401, { error: "Unauthorized" });
+  }
 
   let body;
   try {
@@ -168,20 +330,69 @@ const ROUTES = {
   "/api/portfolio-intelligence": handlePortfolioIntelligence,
 };
 
+// One request-level log entry per HTTP request, regardless of which
+// handler (or none) served it — route, run ID when the response
+// carries one, and a coarse success/failure outcome (Step 104's
+// "preserve useful operational information" goal). This is the single
+// place that calls logEvent() for HTTP traffic; individual handlers
+// never need their own logging call. Never logs headers, the request
+// body, or the response payload itself — only the method, route,
+// status, and (for a failure) the short error message already meant
+// for the client, which never contains a credential (server.js never
+// echoes request content back on error).
+function logRequestOutcome(req, pathname, res) {
+  const statusCode = res.statusCode;
+  const payload = res.__loggedPayload;
+  const runId = payload && payload.persistence && payload.persistence.run_id;
+  logEvent({
+    agent: "http-server",
+    route: pathname,
+    runId: runId || null,
+    dataSource: "http",
+    responseStatus: classifyOutcome(statusCode),
+    errors: statusCode >= 400 ? [(payload && payload.error) || `HTTP ${statusCode}`] : [],
+    request: { method: req.method, statusCode },
+  });
+}
+
 async function requestListener(req, res) {
+  const host = req.headers.host || `localhost:${PORT}`;
+  let pathname;
   try {
-    const host = req.headers.host || `localhost:${PORT}`;
-    const { pathname } = new URL(req.url, `http://${host}`);
+    ({ pathname } = new URL(req.url, `http://${host}`));
+  } catch {
+    pathname = req.url || "UNKNOWN";
+  }
+
+  try {
+    // Rate limiting runs BEFORE route lookup/method/auth checks, and
+    // for every path except /health — so it can't be bypassed by
+    // hitting an unknown route, the wrong method, or a malformed body
+    // (Step 105 requirement 9); all of those still count against the
+    // caller's IP first.
+    if (pathname !== "/health") {
+      const ip = getClientIp(req);
+      const { limited, retryAfterSeconds } = checkRateLimit(ip);
+      if (limited) {
+        res.setHeader("Retry-After", String(retryAfterSeconds));
+        sendJson(res, 429, { error: "Too Many Requests" });
+        return;
+      }
+    }
+
     const handler = ROUTES[pathname];
 
     if (!handler) {
-      return sendJson(res, 404, { error: "Not Found" });
+      sendJson(res, 404, { error: "Not Found" });
+      return;
     }
-    return await handler(req, res);
+    await handler(req, res);
   } catch (err) {
     // Never leak an internal error message, stack trace, or any
     // credential-shaped value to the caller — a generic 500 only.
-    return sendJson(res, 500, { error: "Internal Server Error" });
+    sendJson(res, 500, { error: "Internal Server Error" });
+  } finally {
+    logRequestOutcome(req, pathname, res);
   }
 }
 
@@ -216,4 +427,4 @@ if (require.main === module) {
   process.on("SIGINT", () => shutdown("SIGINT"));
 }
 
-module.exports = { server, requestListener, shutdown, MAX_BODY_BYTES };
+module.exports = { server, requestListener, shutdown, MAX_BODY_BYTES, RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_REQUESTS };

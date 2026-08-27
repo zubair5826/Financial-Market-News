@@ -4,7 +4,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { AlphaVantageMarketAdapter } = require("./alphaVantageMarketAdapter");
+const { AlphaVantageMarketAdapter, SUPPORTED_TIMEFRAMES, DEFAULT_TIMEFRAME } = require("./alphaVantageMarketAdapter");
 const { ERROR_CODES } = require("../../core/errors");
 const { UNKNOWN } = require("../../core/constants");
 
@@ -237,6 +237,135 @@ test("12. a timeout aborts the underlying request and fails safely with TIMEOUT"
   const result = await adapter.fetchData({ symbol: "SPY" });
   assert.equal(result.ok, false);
   assert.equal(result.code, ERROR_CODES.TIMEOUT);
+});
+
+// --- Step 99: requested-vs-returned symbol verification ---
+
+// 1/10. SPY request -> SPY data accepted (existing behavior unchanged).
+test("99-1. a SPY request against a SPY-metadata response is accepted, unchanged", async () => {
+  const adapter = makeAdapter({ fetchImpl: makeMockFetch({ body: dailySeriesBody(twoDayEntries) }) });
+  const result = await adapter.fetchData({ symbol: "SPY" });
+  assert.equal(result.ok, true);
+  assert.ok(result.data.every((c) => c.asset === "SPY"));
+});
+
+// 2. BTC request -> BTC data accepted when the provider's metadata agrees.
+test("99-2. a BTC request against a BTC-metadata response is accepted", async () => {
+  const btcBody = { "Meta Data": { "2. Symbol": "BTC" }, "Time Series (Daily)": twoDayEntries };
+  const adapter = makeAdapter({ fetchImpl: makeMockFetch({ body: btcBody }) });
+  const result = await adapter.fetchData({ symbol: "BTC" });
+  assert.equal(result.ok, true);
+  assert.ok(result.data.every((c) => c.asset === "BTC"));
+});
+
+// 6/8. Provider returned wrong symbol -> rejected, never silently attributed.
+test("99-3. a BTC request against a SPY-metadata response is rejected as INVALID_RESPONSE, never labeled BTC", async () => {
+  const adapter = makeAdapter({ fetchImpl: makeMockFetch({ body: dailySeriesBody(twoDayEntries) }) });
+  const result = await adapter.fetchData({ symbol: "BTC" });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, ERROR_CODES.INVALID_RESPONSE);
+  assert.equal(result.details.requestedSymbol, "BTC");
+  assert.equal(result.details.returnedSymbol, "SPY");
+});
+
+// 5. Case normalization: a case-differing echo is still accepted.
+test("99-4. a lowercase metadata symbol matching the requested symbol case-insensitively is still accepted", () => {
+  return (async () => {
+    const body = { "Meta Data": { "2. Symbol": "spy" }, "Time Series (Daily)": twoDayEntries };
+    const adapter = makeAdapter({ fetchImpl: makeMockFetch({ body }) });
+    const result = await adapter.fetchData({ symbol: "SPY" });
+    assert.equal(result.ok, true);
+  })();
+});
+
+// A response with no Meta Data block at all is never treated as a
+// mismatch by omission — the check only fires when the field is
+// actually present and disagrees.
+test("99-5. a response with no Meta Data symbol field is not treated as a mismatch", async () => {
+  const adapter = makeAdapter({ fetchImpl: makeMockFetch({ body: { "Time Series (Daily)": twoDayEntries } }) });
+  const result = await adapter.fetchData({ symbol: "BTC" });
+  assert.equal(result.ok, true);
+});
+
+// --- Step 103: multi-timeframe support ---
+
+function weeklySeriesBody(entries) {
+  return { "Meta Data": { "2. Symbol": "SPY" }, "Weekly Time Series": entries };
+}
+function monthlySeriesBody(entries) {
+  return { "Meta Data": { "2. Symbol": "SPY" }, "Monthly Time Series": entries };
+}
+
+test("103-1. SUPPORTED_TIMEFRAMES lists exactly 1day, 1week, 1month, and 1day is the default", () => {
+  assert.deepEqual([...SUPPORTED_TIMEFRAMES].sort(), ["1day", "1month", "1week"]);
+  assert.equal(DEFAULT_TIMEFRAME, "1day");
+});
+
+// Each supported timeframe: correct function/series-key used, correct
+// timeframe metadata on every mapped candle.
+test("103-2. timeframe '1week' requests TIME_SERIES_WEEKLY and maps candles with timeframe '1week'", async () => {
+  const calls = [];
+  const adapter = makeAdapter({ fetchImpl: makeMockFetch({ body: weeklySeriesBody(twoDayEntries), onCall: (u) => calls.push(u) }) });
+  const result = await adapter.fetchData({ symbol: "SPY", timeframe: "1week" });
+  assert.equal(result.ok, true);
+  assert.ok(calls[0].includes("function=TIME_SERIES_WEEKLY"));
+  assert.ok(!calls[0].includes("outputsize")); // WEEKLY never sends outputsize
+  assert.ok(result.data.every((r) => r.timeframe === "1week"));
+  assert.ok(result.data.every((r) => r.asset === "SPY"));
+});
+
+test("103-3. timeframe '1month' requests TIME_SERIES_MONTHLY and maps candles with timeframe '1month'", async () => {
+  const calls = [];
+  const adapter = makeAdapter({ fetchImpl: makeMockFetch({ body: monthlySeriesBody(twoDayEntries), onCall: (u) => calls.push(u) }) });
+  const result = await adapter.fetchData({ symbol: "SPY", timeframe: "1month" });
+  assert.equal(result.ok, true);
+  assert.ok(calls[0].includes("function=TIME_SERIES_MONTHLY"));
+  assert.ok(!calls[0].includes("outputsize"));
+  assert.ok(result.data.every((r) => r.timeframe === "1month"));
+});
+
+test("103-4. omitting timeframe defaults to '1day', unchanged from before Step 103", async () => {
+  const calls = [];
+  const adapter = makeAdapter({ fetchImpl: makeMockFetch({ body: dailySeriesBody(twoDayEntries), onCall: (u) => calls.push(u) }) });
+  const result = await adapter.fetchData({ symbol: "SPY" });
+  assert.ok(calls[0].includes("function=TIME_SERIES_DAILY"));
+  assert.ok(result.data.every((r) => r.timeframe === "1day"));
+});
+
+// Unsupported timeframe: explicit rejection, no network call, no
+// silent substitution.
+test("103-5. an unsupported timeframe (intraday) is rejected with MALFORMED_DATA, no network call, never silently substituted with daily", async () => {
+  const adapter = makeAdapter({ fetchImpl: makeMockFetch({ body: dailySeriesBody(twoDayEntries) }) });
+  const { value: result, networkCalled } = await withNetworkGuard(async () => adapter.fetchData({ symbol: "SPY", timeframe: "5min" }));
+  assert.equal(networkCalled, false);
+  assert.equal(result.ok, false);
+  assert.equal(result.code, ERROR_CODES.MALFORMED_DATA);
+  assert.equal(result.details.requestedTimeframe, "5min");
+  assert.deepEqual(result.details.supportedTimeframes, SUPPORTED_TIMEFRAMES);
+});
+
+test("103-6. correct symbol is preserved across every supported timeframe", async () => {
+  const weeklyBtc = { "Meta Data": { "2. Symbol": "BTC" }, "Weekly Time Series": twoDayEntries };
+  const adapter = makeAdapter({ fetchImpl: makeMockFetch({ body: weeklyBtc }) });
+  const result = await adapter.fetchData({ symbol: "BTC", timeframe: "1week" });
+  assert.equal(result.ok, true);
+  assert.ok(result.data.every((r) => r.asset === "BTC"));
+});
+
+// Provider errors are timeframe-agnostic — the same failure handling
+// applies regardless of which timeframe was requested.
+test("103-7. an Alpha Vantage rate-limit body fails safely with RATE_LIMIT for a non-default timeframe too", async () => {
+  const adapter = makeAdapter({ fetchImpl: makeMockFetch({ body: { Note: "rate limited" } }) });
+  const result = await adapter.fetchData({ symbol: "SPY", timeframe: "1week" });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, ERROR_CODES.RATE_LIMIT);
+});
+
+test("103-8. a response missing the weekly series key fails safely with MALFORMED_DATA", async () => {
+  const adapter = makeAdapter({ fetchImpl: makeMockFetch({ body: { "Meta Data": {} } }) });
+  const result = await adapter.fetchData({ symbol: "SPY", timeframe: "1week" });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, ERROR_CODES.MALFORMED_DATA);
 });
 
 // Structural: no external network/broker/exchange call anywhere in this file's own source.

@@ -21,6 +21,8 @@ const { loadLiveMarketData } = require("./alphaVantageMarketLiveSource");
 const { loadLiveNewsData } = require("./alphaVantageNewsLiveSource");
 const { processRequest } = require("../orchestrator");
 const { failSafe, ERROR_CODES } = require("../core/errors");
+const { resolveInstrumentContext, UNKNOWN: INSTRUMENT_UNKNOWN } = require("./instrumentContext");
+const { ALPHA_VANTAGE_INTER_REQUEST_DELAY_MS, delay } = require("./alphaVantageRateLimit");
 
 const DEFAULT_MACRO_SERIES_IDS = ["GNPCA"];
 
@@ -28,27 +30,33 @@ const DEFAULT_MACRO_SERIES_IDS = ["GNPCA"];
 // a real "1 request per second" burst limit — launching the market and
 // news requests at the same instant (the original Promise.all-of-three
 // design) reliably triggers it, since both share one account. Step 48A
-// froze the fix: the two Alpha Vantage calls must be sequential, with
-// this fixed, single-purpose gap between them — not a retry, not a
-// general-purpose rate limiter, not a configurable/public option (see
-// module header). 1100ms is a small deterministic margin over the
-// provider's documented 1000ms boundary. FRED is unaffected (separate
-// account) and is never delayed.
-const ALPHA_VANTAGE_INTER_REQUEST_DELAY_MS = 1100;
+// froze the fix: the two Alpha Vantage calls must be sequential, with a
+// fixed, single-purpose gap between them — not a retry, not a
+// general-purpose rate limiter, not a configurable/public option.
+// ALPHA_VANTAGE_INTER_REQUEST_DELAY_MS/delay() now live in
+// providers/alphaVantageRateLimit.js (Step 103) so
+// alphaVantageMarketLiveSource.js can share the exact same protection
+// between its own successive per-timeframe requests, rather than this
+// file duplicating the constant. FRED is unaffected (separate account)
+// and is never delayed.
 
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// Sequential Alpha Vantage acquisition (Step 48A): market first, then
-// — ONLY when both domains are enabled — the fixed gap above, then
-// news. A single-domain call never waits at all.
-async function acquireAlphaVantage(marketEnabled, newsEnabled, options) {
-  const marketResult = marketEnabled ? await loadLiveMarketData({ adapterConfig: options.marketAdapterConfig }) : null;
+// Sequential Alpha Vantage acquisition (Step 48A): market first
+// (itself now potentially more than one sequential, delay-protected
+// request per timeframe — see alphaVantageMarketLiveSource.js), then —
+// ONLY when both domains are enabled — the fixed gap above, then news.
+// A single-domain call never waits at all.
+// symbol: the one resolved instrument symbol (Step 99) both Alpha
+//   Vantage calls must use — never re-resolved or re-parsed here;
+//   undefined lets each live-source fall back to its own frozen SPY
+//   default, preserving existing SPY-only workflows unchanged.
+async function acquireAlphaVantage(marketEnabled, newsEnabled, options, symbol) {
+  const marketResult = marketEnabled
+    ? await loadLiveMarketData({ symbol, timeframes: options.marketTimeframes, adapterConfig: options.marketAdapterConfig })
+    : null;
   if (marketEnabled && newsEnabled) {
     await delay(ALPHA_VANTAGE_INTER_REQUEST_DELAY_MS);
   }
-  const newsResult = newsEnabled ? await loadLiveNewsData({ adapterConfig: options.newsAdapterConfig }) : null;
+  const newsResult = newsEnabled ? await loadLiveNewsData({ symbol, adapterConfig: options.newsAdapterConfig }) : null;
   return { marketResult, newsResult };
 }
 
@@ -71,6 +79,10 @@ function rejectAmbiguousMerge(fieldName) {
 //   to the respective new live-source calls — production callers
 //   never need these; they exist solely for offline test injection,
 //   exactly mirroring every other layer in this project.
+// options.marketTimeframes: forwarded verbatim to loadLiveMarketData()
+//   (Step 103) — an array of timeframe labels, e.g. ["1day", "1week"].
+//   Omitted entirely when not supplied, so loadLiveMarketData() applies
+//   its own default (["1day"]) — the exact pre-Step-103 behavior.
 async function runMarketIntelligenceRequest(request, options = {}) {
   const macroOptions = (options && options.macro) || {};
   const marketOptions = (options && options.market) || {};
@@ -106,6 +118,19 @@ async function runMarketIntelligenceRequest(request, options = {}) {
   const seriesIds =
     Array.isArray(options.macroSeriesIds) && options.macroSeriesIds.length > 0 ? options.macroSeriesIds : DEFAULT_MACRO_SERIES_IDS;
 
+  // Step 99 fix: resolve the ONE instrument this request is actually
+  // about, centrally, once — never re-parsed per provider. macro is
+  // never given a symbol at all (FRED's series are whole-economy
+  // indicators, not instrument-specific — see fredMacroComposer.js;
+  // macro records carry no `asset` field to mislabel). Only Alpha
+  // Vantage's two instrument-specific domains (technical candles,
+  // news) receive the resolved symbol; when the caller supplied no
+  // explicit request.asset, this resolves to UNKNOWN and both
+  // live-sources fall back to their own frozen SPY default —
+  // preserving every existing SPY-only workflow exactly as before.
+  const instrumentContext = resolveInstrumentContext(request);
+  const resolvedSymbol = instrumentContext.normalizedSymbol !== INSTRUMENT_UNKNOWN ? instrumentContext.normalizedSymbol : undefined;
+
   // FRED (a separate provider/account, unaffected by Alpha Vantage's
   // limit) still acquires independently/concurrently. The two Alpha
   // Vantage domains, if both enabled, are acquired sequentially with
@@ -116,7 +141,7 @@ async function runMarketIntelligenceRequest(request, options = {}) {
     macroEnabled
       ? loadLiveMacroData(seriesIds, { adapterConfig: options.macroAdapterConfig, composeOptions: options.macroComposeOptions })
       : Promise.resolve(null),
-    acquireAlphaVantage(marketEnabled, newsEnabled, options),
+    acquireAlphaVantage(marketEnabled, newsEnabled, options, resolvedSymbol),
   ]);
 
   // A fresh object built from the caller's request — the caller's own
@@ -133,8 +158,18 @@ async function runMarketIntelligenceRequest(request, options = {}) {
   const pipelineResult = processRequest(mergedRequest);
 
   const diagnostics = {
+    // Exposed so a caller can see exactly which instrument context was
+    // actually resolved and used for this run (Step 99) — never
+    // reconstructed or re-guessed downstream from this diagnostic.
+    instrument: instrumentContext,
     macro: macroEnabled ? { seriesResults: macroResult.seriesResults, warnings: macroResult.warnings } : null,
-    market: marketEnabled ? { providerResult: marketResult.providerResult, warnings: marketResult.warnings } : null,
+    // timeframeResults (Step 103): every timeframe this run actually
+    // requested, each with its own explicit outcome — never collapsed
+    // away, so a caller can always see exactly which timeframe(s) were
+    // unavailable and why, without guessing from providerResult alone.
+    market: marketEnabled
+      ? { providerResult: marketResult.providerResult, timeframeResults: marketResult.timeframeResults, warnings: marketResult.warnings }
+      : null,
     news: newsEnabled ? { providerResult: newsResult.providerResult, warnings: newsResult.warnings } : null,
   };
 

@@ -213,3 +213,25 @@ test("16. text is the only field ever interpreted as natural language; malformed
     assert.equal(result.portfolio, null);
   }
 });
+
+// Step 102: deliberate scope decision, not an oversight — Portfolio
+// Intelligence is NOT written to the intelligence run store
+// (data/runs.jsonl). Its output has no agent pipeline, no
+// risk-manager/chief-trading-manager result, and no freshness/
+// data-quality status — the Step 102 schema those fields depend on
+// simply does not exist here (see the module comment at the top of
+// this file: no provider, no Market Intelligence, no agent chain at
+// all). Forcing this output into that schema would fabricate fields it
+// doesn't have, which this project's own discipline forbids. Verified
+// two ways: no coupling to the run store module, and no observable
+// file-system side effect from a request.
+test("102-9. Portfolio Intelligence does not reference or write to the intelligence run store (deliberate Step 102 scope decision)", () => {
+  const fs = require("node:fs");
+  const source = fs.readFileSync(require.resolve("./portfolioIntelligence"), "utf8");
+  assert.ok(!source.includes("runStore"), "portfolioIntelligence.js must not depend on data/runStore.js");
+
+  const before = fs.existsSync("./data/runs.jsonl") ? fs.statSync("./data/runs.jsonl").size : null;
+  runPortfolioIntelligenceRequest({ text: VALID_TEXT });
+  const after = fs.existsSync("./data/runs.jsonl") ? fs.statSync("./data/runs.jsonl").size : null;
+  assert.equal(before, after, "a Portfolio Intelligence request must never grow data/runs.jsonl");
+});

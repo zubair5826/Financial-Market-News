@@ -1,16 +1,43 @@
 // Alpha Vantage Market Data Provider Adapter — implements the contract
-// frozen in Steps 40/41. This file is NOT connected to Alpha Vantage:
-// it contains only the request-construction/response-mapping logic; no
-// network call happens unless a caller actually invokes fetchData()/
+// frozen in Steps 40/41, extended in Step 103 to support more than one
+// timeframe. This file is NOT connected to Alpha Vantage: it contains
+// only the request-construction/response-mapping logic; no network
+// call happens unless a caller actually invokes fetchData()/
 // healthCheck() with real config, which nothing in this repository
 // does automatically.
 //
-// Single-call contract: TIME_SERIES_DAILY returns both the metadata
-// wrapper and the full daily series in one response — unlike FRED's
-// two-endpoint design (fredMacroAdapter.js), there is no second call to
-// keep atomic; this adapter mirrors that file's structure everywhere
-// else (AbortController-based timeout, credential handling, error
+// Single-call contract per timeframe: each supported Alpha Vantage
+// TIME_SERIES_* function returns both a metadata wrapper and its full
+// series in one response — unlike FRED's two-endpoint design
+// (fredMacroAdapter.js), there is no second call to keep atomic; this
+// adapter mirrors that file's structure everywhere else
+// (AbortController-based timeout, credential handling, error
 // classification) so the two providers stay consistent.
+//
+// Step 103 — which timeframes this integration supports, and why:
+// the Technical Agent itself (agents/technical-agent/index.js) imposes
+// no fixed timeframe vocabulary at all — it groups whatever
+// `candle.timeframe` labels are actually present in its input and
+// analyzes each independently (see its own README.md's "Timeframe
+// Handling" section and conflicts.js's TIMEFRAME_CONFLICT, whose own
+// spec example uses "1H"/"4H"-style labels). So "which timeframes are
+// required" reduces to: which genuinely distinct, reliably-obtainable
+// Alpha Vantage series can this integration honestly supply, so
+// multi-timeframe conflict detection has more than one real timeframe
+// to compare on live data. TIMEFRAME_CONFIG below lists exactly the
+// three that qualify — TIME_SERIES_DAILY (existing, unchanged),
+// TIME_SERIES_WEEKLY, and TIME_SERIES_MONTHLY. All three are simple,
+// symbol-only, single-call, free-tier-documented endpoints with no
+// extra required parameter. TIME_SERIES_INTRADAY is deliberately
+// EXCLUDED: it requires an additional `interval` parameter this
+// integration has never modeled, and Alpha Vantage's own documentation
+// describes its historical intraday coverage as more restricted than
+// daily/weekly/monthly — it cannot honestly be called "reliably
+// obtainable" under the current integration. A caller requesting an
+// unsupported timeframe (intraday or anything else) gets an explicit
+// MALFORMED_DATA failure naming exactly what is/isn't supported —
+// never a silent fallback to daily, and never a fabricated/relabeled
+// series.
 //
 // Data Controller is NOT part of this path — this adapter feeds
 // agents/technical-agent/ directly (via candle-shaped output matching
@@ -22,11 +49,26 @@ const { createCandle } = require("../../agents/technical-agent/technicalRecord")
 const { UNKNOWN } = require("../../core/constants");
 const { INFORMATION_CLASSIFICATIONS } = require("../../core/classification");
 const { failSafe, ERROR_CODES } = require("../../core/errors");
+const { symbolsMatch } = require("../instrumentContext");
 
 const ALPHA_VANTAGE_BASE_URL = "https://www.alphavantage.co/query";
 const ALPHA_VANTAGE_SOURCE_NAME = "Alpha Vantage";
 const DEFAULT_TIMEOUT_MS = 10_000;
-const TIME_SERIES_KEY = "Time Series (Daily)";
+
+// Every genuinely distinct, reliably-obtainable timeframe this
+// integration supports, and exactly how to fetch/parse each — see the
+// module comment above for why these three and no others. `outputsize`
+// is an Alpha Vantage TIME_SERIES_DAILY-only parameter; WEEKLY/MONTHLY
+// always return their full available history regardless, so it's never
+// sent for those two (an unsupported/ignored parameter would be
+// harmless, but omitting it is the more honest, minimal request).
+const TIMEFRAME_CONFIG = Object.freeze({
+  "1day": Object.freeze({ function: "TIME_SERIES_DAILY", seriesKey: "Time Series (Daily)", supportsOutputSize: true }),
+  "1week": Object.freeze({ function: "TIME_SERIES_WEEKLY", seriesKey: "Weekly Time Series", supportsOutputSize: false }),
+  "1month": Object.freeze({ function: "TIME_SERIES_MONTHLY", seriesKey: "Monthly Time Series", supportsOutputSize: false }),
+});
+const SUPPORTED_TIMEFRAMES = Object.freeze(Object.keys(TIMEFRAME_CONFIG));
+const DEFAULT_TIMEFRAME = "1day";
 
 class AlphaVantageMarketAdapter extends ProviderAdapter {
   constructor(config = {}) {
@@ -43,9 +85,13 @@ class AlphaVantageMarketAdapter extends ProviderAdapter {
     this.timeoutMs = config.timeoutMs || DEFAULT_TIMEOUT_MS;
   }
 
-  // request: { symbol: string, outputsize?: "compact" | "full" }
-  // Resolves to { ok: true, data: Candle[] } (agents/technical-agent
-  // shape) or a failSafe() result — never a partial/fabricated candle.
+  // request: { symbol: string, timeframe?: "1day" | "1week" | "1month",
+  //   outputsize?: "compact" | "full" }. timeframe defaults to "1day"
+  //   (DEFAULT_TIMEFRAME) when omitted — every pre-Step-103 caller is
+  //   completely unaffected. Resolves to { ok: true, data: Candle[] }
+  //   (agents/technical-agent shape) or a failSafe() result — never a
+  //   partial/fabricated candle, and never a candle mislabeled with a
+  //   timeframe other than the one actually requested and confirmed.
   async fetchData(request) {
     if (!request || typeof request !== "object" || !request.symbol || typeof request.symbol !== "string") {
       return failSafe(ERROR_CODES.MALFORMED_DATA, "AlphaVantageMarketAdapter.fetchData requires request.symbol (string).");
@@ -54,27 +100,61 @@ class AlphaVantageMarketAdapter extends ProviderAdapter {
       return failSafe(ERROR_CODES.AUTH_FAILURE, "No Alpha Vantage API key configured for this adapter instance.");
     }
 
-    const symbol = request.symbol;
-    const outputsize = request.outputsize === "full" ? "full" : "compact";
-
-    const url = this.#buildUrl({ function: "TIME_SERIES_DAILY", symbol, outputsize });
-    const response = await this.#request(url, "Alpha Vantage TIME_SERIES_DAILY");
-    if (!response.ok) return response.failure;
-
-    const parsed = await this.#parseJsonResponse(response.value, "Alpha Vantage TIME_SERIES_DAILY");
-    if (!parsed.ok) return parsed.failure;
-
-    const body = parsed.body;
-    const series = body[TIME_SERIES_KEY];
-    if (!series || typeof series !== "object" || Array.isArray(series)) {
+    const timeframe = request.timeframe === undefined ? DEFAULT_TIMEFRAME : request.timeframe;
+    const timeframeConfig = TIMEFRAME_CONFIG[timeframe];
+    if (!timeframeConfig) {
+      // Never a silent fallback to daily, never a guess — an explicit,
+      // structured rejection naming both what was requested and what
+      // this integration actually supports. No network call is made.
       return failSafe(
         ERROR_CODES.MALFORMED_DATA,
-        `Alpha Vantage response did not contain a usable "${TIME_SERIES_KEY}" object.`,
-        { symbol }
+        `Unsupported timeframe "${timeframe}" — this integration supports: ${SUPPORTED_TIMEFRAMES.join(", ")}.`,
+        { requestedTimeframe: timeframe, supportedTimeframes: SUPPORTED_TIMEFRAMES }
       );
     }
 
-    return { ok: true, data: this.#mapToCandles(symbol, series) };
+    const symbol = request.symbol;
+    const outputsize = request.outputsize === "full" ? "full" : "compact";
+
+    const urlParams = { function: timeframeConfig.function, symbol };
+    if (timeframeConfig.supportsOutputSize) urlParams.outputsize = outputsize;
+
+    const url = this.#buildUrl(urlParams);
+    const response = await this.#request(url, `Alpha Vantage ${timeframeConfig.function}`);
+    if (!response.ok) return response.failure;
+
+    const parsed = await this.#parseJsonResponse(response.value, `Alpha Vantage ${timeframeConfig.function}`);
+    if (!parsed.ok) return parsed.failure;
+
+    const body = parsed.body;
+    const series = body[timeframeConfig.seriesKey];
+    if (!series || typeof series !== "object" || Array.isArray(series)) {
+      return failSafe(
+        ERROR_CODES.MALFORMED_DATA,
+        `Alpha Vantage response did not contain a usable "${timeframeConfig.seriesKey}" object.`,
+        { symbol, timeframe }
+      );
+    }
+
+    // Step 99 fix: Alpha Vantage's own "Meta Data" block echoes which
+    // symbol its response is actually for. If present and it disagrees
+    // with what was requested, this response can never be attributed
+    // to the requested symbol — reject it rather than labeling
+    // mismatched data with the caller's requested symbol. Only checked
+    // when the field is actually present, so a minimal/synthetic
+    // response with no Meta Data block is unaffected (never treated as
+    // a mismatch by omission — absence of proof is not proof of a
+    // mismatch).
+    const metaSymbol = body["Meta Data"] && body["Meta Data"]["2. Symbol"];
+    if (typeof metaSymbol === "string" && metaSymbol.trim() && !symbolsMatch(symbol, metaSymbol)) {
+      return failSafe(
+        ERROR_CODES.INVALID_RESPONSE,
+        `Alpha Vantage returned data for "${metaSymbol}" but "${symbol}" was requested — refusing to attribute this data to the requested symbol.`,
+        { requestedSymbol: symbol, returnedSymbol: metaSymbol }
+      );
+    }
+
+    return { ok: true, data: this.#mapToCandles(symbol, timeframe, series) };
   }
 
   // Reuses fetchData() itself rather than a second, independent request
@@ -162,11 +242,11 @@ class AlphaVantageMarketAdapter extends ProviderAdapter {
     return Number.isFinite(num) ? num : UNKNOWN;
   }
 
-  #mapToCandles(symbol, series) {
+  #mapToCandles(symbol, timeframe, series) {
     return Object.entries(series).map(([date, entry]) =>
       createCandle({
         asset: symbol,
-        timeframe: "1day",
+        timeframe,
         timestamp: date,
         open: this.#parseNumericField(entry && entry["1. open"]),
         high: this.#parseNumericField(entry && entry["2. high"]),
@@ -192,4 +272,4 @@ class AlphaVantageMarketAdapter extends ProviderAdapter {
   }
 }
 
-module.exports = { AlphaVantageMarketAdapter };
+module.exports = { AlphaVantageMarketAdapter, SUPPORTED_TIMEFRAMES, DEFAULT_TIMEFRAME };

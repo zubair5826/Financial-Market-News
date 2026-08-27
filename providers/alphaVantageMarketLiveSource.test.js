@@ -128,3 +128,155 @@ test("7. the caller's options object is not mutated", async () => {
     assert.deepEqual(Object.keys(options), ["adapterConfig"]);
   });
 });
+
+// --- Step 99: requested-symbol pass-through ---
+
+// 1/10. No symbol option -> SPY default preserved (existing behavior unchanged).
+test("99-1. omitting options.symbol still requests symbol=SPY, unchanged", async () => {
+  await withEnvKey(SYNTHETIC_KEY, async () => {
+    const calls = [];
+    await loadLiveMarketData({ adapterConfig: { fetchImpl: makeMockFetch({ body: dailySeriesBody(sampleEntries), onCall: (u) => calls.push(u) }) } });
+    assert.ok(calls[0].includes("symbol=SPY"));
+  });
+});
+
+// 2. An explicit symbol flows through to the actual request and the labeled candles.
+test("99-2. options.symbol='BTC' requests symbol=BTC, and returned candles are labeled BTC (when the provider agrees)", async () => {
+  await withEnvKey(SYNTHETIC_KEY, async () => {
+    const calls = [];
+    const btcBody = { "Meta Data": { "2. Symbol": "BTC" }, "Time Series (Daily)": sampleEntries };
+    const result = await loadLiveMarketData({
+      symbol: "BTC",
+      adapterConfig: { fetchImpl: makeMockFetch({ body: btcBody, onCall: (u) => calls.push(u) }) },
+    });
+    assert.ok(calls[0].includes("symbol=BTC"));
+    assert.equal(result.technicalCandles[0].asset, "BTC");
+  });
+});
+
+// 3/6/8. A requested symbol the provider's response disagrees with fails
+// safely — never silently substituted with SPY data.
+test("99-3. options.symbol='BTC' against a SPY-metadata response fails safely, never returns SPY data labeled BTC", async () => {
+  await withEnvKey(SYNTHETIC_KEY, async () => {
+    const result = await loadLiveMarketData({
+      symbol: "BTC",
+      adapterConfig: { fetchImpl: makeMockFetch({ body: dailySeriesBody(sampleEntries) }) },
+    });
+    assert.deepEqual(result.technicalCandles, []);
+    assert.equal(result.providerResult.ok, false);
+    assert.equal(result.providerResult.code, "INVALID_RESPONSE");
+  });
+});
+
+// --- Step 103: multi-timeframe support ---
+
+function weeklySeriesBody(entries) {
+  return { "Meta Data": { "2. Symbol": "SPY" }, "Weekly Time Series": entries };
+}
+
+// Fast-timer patch, same technique as marketIntelligenceApplicationService.test.js:
+// wraps the real global.setTimeout to record the requested delay while
+// firing almost immediately, so the real 1100ms gap is never actually
+// waited out in this offline test suite.
+function withFastTimers(fn) {
+  const originalSetTimeout = global.setTimeout;
+  const timeoutCalls = [];
+  global.setTimeout = (cb, ms, ...args) =>
+    originalSetTimeout(
+      () => {
+        timeoutCalls.push(ms);
+        cb();
+      },
+      0,
+      ...args
+    );
+  return fn(timeoutCalls).finally(() => {
+    global.setTimeout = originalSetTimeout;
+  });
+}
+
+test("103-1. requesting two supported timeframes makes two sequential calls, one per timeframe, with correct metadata", async () => {
+  await withEnvKey(SYNTHETIC_KEY, async () => {
+    await withFastTimers(async (timeoutCalls) => {
+      const calls = [];
+      const fetchImpl = async (url) => {
+        calls.push(url);
+        if (url.includes("TIME_SERIES_WEEKLY")) return jsonResponse(200, weeklySeriesBody(sampleEntries));
+        return jsonResponse(200, dailySeriesBody(sampleEntries));
+      };
+      const result = await loadLiveMarketData({ timeframes: ["1day", "1week"], adapterConfig: { fetchImpl } });
+      assert.equal(calls.length, 2);
+      assert.ok(calls[0].includes("function=TIME_SERIES_DAILY"));
+      assert.ok(calls[1].includes("function=TIME_SERIES_WEEKLY"));
+      assert.deepEqual(
+        result.technicalCandles.map((c) => c.timeframe).sort(),
+        ["1day", "1week"]
+      );
+      assert.deepEqual(result.timeframeResults.map((r) => ({ timeframe: r.timeframe, ok: r.ok })), [
+        { timeframe: "1day", ok: true },
+        { timeframe: "1week", ok: true },
+      ]);
+      // Rate-limit behavior: exactly one delay, between the two real calls.
+      assert.deepEqual(timeoutCalls, [1100]);
+    });
+  });
+});
+
+test("103-2. a single (default) timeframe request incurs zero delay — unchanged from before Step 103", async () => {
+  await withEnvKey(SYNTHETIC_KEY, async () => {
+    await withFastTimers(async (timeoutCalls) => {
+      await loadLiveMarketData({ adapterConfig: { fetchImpl: makeMockFetch({ body: dailySeriesBody(sampleEntries) }) } });
+      assert.deepEqual(timeoutCalls, []);
+    });
+  });
+});
+
+test("103-3. an unsupported timeframe is marked unavailable, explicitly reported, and never contacts the network", async () => {
+  await withEnvKey(SYNTHETIC_KEY, async () => {
+    const calls = [];
+    const result = await loadLiveMarketData({
+      timeframes: ["1day", "5min"],
+      adapterConfig: { fetchImpl: makeMockFetch({ body: dailySeriesBody(sampleEntries), onCall: (u) => calls.push(u) }) },
+    });
+    assert.equal(calls.length, 1); // only the supported "1day" call ever reaches the network
+    const unsupported = result.timeframeResults.find((r) => r.timeframe === "5min");
+    assert.equal(unsupported.ok, false);
+    assert.equal(unsupported.code, "UNSUPPORTED_TIMEFRAME");
+    assert.ok(result.warnings.some((w) => w.includes("5min") && w.includes("unavailable")));
+    // The supported timeframe's own data is never discarded because a
+    // sibling request was unsupported.
+    assert.equal(result.technicalCandles.length, 1);
+  });
+});
+
+test("103-4. a request for only unsupported timeframes never contacts the network at all, and providerResult.ok is false", async () => {
+  await withEnvKey(SYNTHETIC_KEY, async () => {
+    const { value: result, networkCalled } = await withNetworkGuard(async () =>
+      loadLiveMarketData({ timeframes: ["5min", "15min"] })
+    );
+    assert.equal(networkCalled, false);
+    assert.deepEqual(result.technicalCandles, []);
+    assert.equal(result.providerResult.ok, false);
+    assert.equal(result.timeframeResults.length, 2);
+    assert.ok(result.timeframeResults.every((r) => r.code === "UNSUPPORTED_TIMEFRAME"));
+  });
+});
+
+test("103-5. a provider error on one timeframe does not prevent a sibling timeframe from succeeding", async () => {
+  await withEnvKey(SYNTHETIC_KEY, async () => {
+    await withFastTimers(async () => {
+      const fetchImpl = async (url) => {
+        if (url.includes("TIME_SERIES_WEEKLY")) return jsonResponse(200, { "Error Message": "Invalid API call." });
+        return jsonResponse(200, dailySeriesBody(sampleEntries));
+      };
+      const result = await loadLiveMarketData({ timeframes: ["1day", "1week"], adapterConfig: { fetchImpl } });
+      const daily = result.timeframeResults.find((r) => r.timeframe === "1day");
+      const weekly = result.timeframeResults.find((r) => r.timeframe === "1week");
+      assert.equal(daily.ok, true);
+      assert.equal(weekly.ok, false);
+      assert.equal(weekly.code, "INVALID_RESPONSE");
+      assert.equal(result.providerResult.ok, true); // partial success still reports overall success
+      assert.equal(result.technicalCandles.length, 1); // only the daily candle
+    });
+  });
+});

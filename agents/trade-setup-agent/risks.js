@@ -9,10 +9,15 @@
 //     domain's own report reports unresolved internal conflicts.
 //   CONFLICT_RISK: cross-domain evidence disagrees (conflicting_evidence
 //     is non-empty).
-//   TIMING_RISK: any domain's own uncertainties mention STALE data or
-//     UNKNOWN freshness.
+//   TIMING_RISK: any domain's own records carry a structured STALE_DATA
+//     signal or an UNKNOWN freshness_status (Step 101: read from
+//     structured fields, never from an uncertainty's message text — a
+//     rewording of that text must never change this flag).
 //   UNKNOWN: reserved for cases with no evidence to assess risk at all
 //     (never auto-activated by this function — see README.md).
+
+const { ERROR_CODES } = require("../../core/errors");
+const { FRESHNESS_STATES } = require("../../core/freshness");
 
 const SETUP_RISKS = Object.freeze({
   DATA_RISK: "DATA_RISK",
@@ -29,11 +34,26 @@ function hasUnresolvedConflicts(evidence) {
   return Boolean(evidence && Array.isArray(evidence.conflicts) && evidence.conflicts.length > 0);
 }
 
+// Structural stale detection: an OBJECT entry in this domain's own
+// (full, unfiltered) warnings array whose `code` is exactly
+// ERROR_CODES.STALE_DATA — set only by failSafe(), never guessed from
+// an entry's message text.
+function hasStaleSignal(evidence) {
+  if (!evidence || !Array.isArray(evidence.warnings)) return false;
+  return evidence.warnings.some((w) => w && typeof w === "object" && w.code === ERROR_CODES.STALE_DATA);
+}
+
+// Structural unknown-freshness detection: one of this domain's own
+// sampled records has freshness_status === FRESHNESS_STATES.UNKNOWN —
+// the same field every agent already sets on each validated record,
+// never re-derived from an uncertainty's wording.
+function hasUnknownFreshnessSignal(evidence) {
+  if (!evidence || !Array.isArray(evidence.items)) return false;
+  return evidence.items.some((item) => item && item.freshness_status === FRESHNESS_STATES.UNKNOWN);
+}
+
 function hasTimingConcern(evidence) {
-  if (!evidence || !Array.isArray(evidence.uncertainties)) return false;
-  return evidence.uncertainties.some(
-    (u) => typeof u === "string" && (u.includes("STALE") || u.toLowerCase().includes("freshness unknown"))
-  );
+  return hasStaleSignal(evidence) || hasUnknownFreshnessSignal(evidence);
 }
 
 function detectSetupRisks({ newsEvidence, macroEvidence, technicalEvidence, sentimentEvidence }, conflictingEvidence) {
