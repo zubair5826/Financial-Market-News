@@ -17,8 +17,10 @@ const path = require("node:path");
 // as body.options.runStore.filePath — the JSON HTTP request body is the
 // only channel available at this layer) keeps these tests from
 // appending to the real data/runs.jsonl, cleaned up once after this
-// whole file's tests complete. One test below (empty body) cannot
-// supply this override at all — see its own comment.
+// whole file's tests complete. Step 106: the one test that has no body
+// to carry that override (empty body) now redirects the run store with
+// the RUN_STORE_FILE environment variable instead, so NO test in this
+// file writes to the production run store any more.
 const TEST_RUNS_FILE = path.join(os.tmpdir(), `server-test-runs-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`);
 const RUN_STORE_OPTIONS = { runStore: { filePath: TEST_RUNS_FILE } };
 
@@ -99,6 +101,54 @@ async function withRateLimitEnv({ windowMs, maxRequests }, fn) {
 
 function minimalIntelligenceBody(overrides = {}) {
   return JSON.stringify({ request: { query: "Assess BTC", asset: "BTC" }, options: RUN_STORE_OPTIONS, ...overrides });
+}
+
+// Shared by every test that inspects a real operational log entry
+// (Step 111's fix to test 13c, Step 113's fix to test 105-16):
+// logs/system.log is one real file shared by every test FILE the full
+// suite runs concurrently — reading "the last line" races against an
+// unrelated file's own logEvent() call landing after this test's own
+// write (confirmed directly: both 13c and 105-16 passed every time run
+// in isolation, but failed intermittently as part of the full suite).
+// `route` is already a strong filter on its own: it is set ONLY by
+// server.js's own requestListener (logRequestOutcome) — no other
+// logEvent() call site anywhere in this codebase (every agent, the
+// orchestrator) ever passes one, so no OTHER test file's writes can
+// ever match a route at all. Within THIS file, tests run sequentially
+// (no concurrency enabled), so a `sinceIso` timestamp floor (captured
+// immediately before the request) rules out this file's own earlier
+// tests too. Matching on route + a timestamp floor, and — whenever the
+// response actually carries one — the response's own run_id,
+// deterministically identifies the entry a specific request produced,
+// with no dependency on file position. Checks the immediate rotated
+// backup (LOG_FILE + ".1") too, in case a concurrent write from
+// another process rotated the file in the narrow window between the
+// request and this read — production rotation behavior itself is
+// untouched; this only makes the test's own read robust to it.
+function findLogEntriesForRequest(logFilePath, { route, sinceIso, runId } = {}) {
+  const matches = [];
+  for (const filePath of [logFilePath, `${logFilePath}.1`]) {
+    let content;
+    try {
+      content = fs.readFileSync(filePath, "utf8");
+    } catch {
+      continue; // a rotated backup may not exist — fine.
+    }
+    for (const line of content.split("\n")) {
+      if (line.length === 0) continue;
+      let parsed;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        continue; // never let a concurrently-mid-write line crash a test.
+      }
+      if (route !== undefined && parsed.route !== route) continue;
+      if (sinceIso !== undefined && !(parsed.timestamp >= sinceIso)) continue;
+      if (runId !== undefined && parsed.run_id !== runId) continue;
+      matches.push(parsed);
+    }
+  }
+  return matches;
 }
 
 // --- Health endpoint (never authenticated, never rate-limited) ---
@@ -369,18 +419,23 @@ test("4b. POST /api/intelligence without options.macro.enabled never enables FRE
 });
 
 // 5. Empty body on /api/intelligence -> still 200 (defaults to {} request/options).
-// NOTE (Step 102): a genuinely empty POST body has no channel to carry
-// a runStore override, so this one request is persisted to the real
-// data/runs.jsonl (a single harmless, already-redacted line) rather
-// than a test temp file — an accepted, documented exception, not an
-// oversight; every other test in this file redirects via
-// RUN_STORE_OPTIONS.
+// Step 106: a genuinely empty POST body has no channel to carry a
+// runStore override, which used to mean this one request appended a
+// synthetic row to the REAL data/runs.jsonl every time `npm test` ran.
+// server.js now reads a RUN_STORE_FILE environment variable as its
+// server-level default, so this test redirects the write to the same
+// throwaway temp file every other test here uses. Nothing in this
+// suite touches the production run store any more — asserted directly
+// by test 106-3 below.
 test("5. POST /api/intelligence with no body at all still returns 200 (empty request degrades safely)", async () => {
-  await withRunningServer(async ({ baseUrl }) => {
-    const res = await fetch(`${baseUrl}/api/intelligence`, { method: "POST", headers: AUTH_HEADERS });
-    assert.equal(res.status, 200);
-    const body = await res.json();
-    assert.ok("pipelineResult" in body);
+  await withEnvVar("RUN_STORE_FILE", TEST_RUNS_FILE, async () => {
+    await withRunningServer(async ({ baseUrl }) => {
+      const res = await fetch(`${baseUrl}/api/intelligence`, { method: "POST", headers: AUTH_HEADERS });
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.ok("pipelineResult" in body);
+      assert.equal(body.persistence.status, "PERSISTED");
+    });
   });
 });
 
@@ -548,7 +603,9 @@ test("13b. POST /api/intelligence persists a run record reachable from the HTTP 
 // minimal-scope choice; see logger.js's own module comment), so this
 // one test reads the real file — a single, harmless, already-redacted
 // line, self-capped by Step 104's own rotation, exactly the same
-// accepted exception already documented above.
+// accepted exception already documented above. See
+// findLogEntriesForRequest() above (Step 111) for why this matches on
+// run_id rather than file position.
 test("13c. a request produces a real operational log entry with route, run_id, and outcome", async () => {
   const { flushLogs, LOG_FILE } = require("./logs/logger");
   await withRunningServer(async ({ baseUrl }) => {
@@ -558,16 +615,16 @@ test("13c. a request produces a real operational log entry with route, run_id, a
       body: minimalIntelligenceBody(),
     });
     const body = await res.json();
+    const runId = body.persistence.run_id;
     await flushLogs();
-    const lines = fs
-      .readFileSync(LOG_FILE, "utf8")
-      .split("\n")
-      .filter((l) => l.length > 0);
-    const last = JSON.parse(lines[lines.length - 1]);
-    assert.equal(last.route, "/api/intelligence");
-    assert.equal(last.run_id, body.persistence.run_id);
-    assert.equal(last.response_status, "SUCCESS");
-    assert.deepEqual(last.errors, []);
+
+    const matches = findLogEntriesForRequest(LOG_FILE, { route: "/api/intelligence", runId });
+    assert.equal(matches.length, 1, `expected exactly one log entry with run_id ${runId} in ${LOG_FILE} or its .1 backup`);
+    const [match] = matches;
+    assert.equal(match.route, "/api/intelligence");
+    assert.equal(match.run_id, runId);
+    assert.equal(match.response_status, "SUCCESS");
+    assert.deepEqual(match.errors, []);
   });
 });
 
@@ -628,24 +685,147 @@ test("105-15. the configured API_AUTH_TOKEN value never appears in any response,
   });
 });
 
+// Step 113 fix: this used to assert on "the last line" of the shared
+// logs/system.log, the same race already found and fixed in test 13c
+// (Step 111) — confirmed directly, this test failed intermittently as
+// part of the full suite while always passing in isolation. This
+// request never reaches runApplicationRequest() at all (auth fails
+// first), so it never produces a run_id to match on the way 13c does;
+// findLogEntriesForRequest()'s route + sinceIso timestamp floor is the
+// available substitute — see its own comment above for why that pair
+// is already sufficient to uniquely identify this request's entry.
 test("105-16. the configured API_AUTH_TOKEN value never appears in the operational log entry for a request", async () => {
   const { flushLogs, LOG_FILE } = require("./logs/logger");
   await withRunningServer(async ({ baseUrl }) => {
+    const sinceIso = new Date().toISOString();
     await fetch(`${baseUrl}/api/intelligence`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: "Bearer wrong-token" },
       body: minimalIntelligenceBody(),
     });
     await flushLogs();
-    const lines = fs
-      .readFileSync(LOG_FILE, "utf8")
-      .split("\n")
-      .filter((l) => l.length > 0);
-    const last = JSON.parse(lines[lines.length - 1]);
-    assert.equal(last.response_status, "CLIENT_ERROR");
-    const serialized = JSON.stringify(last);
+
+    const matches = findLogEntriesForRequest(LOG_FILE, { route: "/api/intelligence", sinceIso });
+    assert.equal(matches.length, 1, "expected exactly one /api/intelligence log entry since this request began");
+    const [match] = matches;
+    assert.equal(match.response_status, "CLIENT_ERROR");
+    const serialized = JSON.stringify(match);
     assert.ok(!serialized.includes(TEST_AUTH_TOKEN));
     assert.ok(!serialized.includes("wrong-token"));
     assert.ok(!serialized.toLowerCase().includes("bearer"));
   });
+});
+
+// --- Step 106: X-Forwarded-For can no longer be used to evade the
+// rate limiter, and the production run store is never written by this
+// suite. ---
+
+// The exact bypass this step closed: before it, six requests carrying
+// six different forged X-Forwarded-For values all returned 200 against
+// a limit of three, because each forged value opened its own bucket.
+test("106-1. with TRUST_PROXY off (default), forged X-Forwarded-For values cannot open new rate-limit buckets", async () => {
+  await withEnvVar("TRUST_PROXY", undefined, async () => {
+    await withRateLimitEnv({ windowMs: 60_000, maxRequests: 3 }, async () => {
+      await withRunningServer(async ({ baseUrl }) => {
+        const statuses = [];
+        for (let i = 1; i <= 6; i++) {
+          const res = await fetch(`${baseUrl}/api/intelligence`, {
+            method: "POST",
+            headers: { ...JSON_AUTH_HEADERS, "X-Forwarded-For": `10.0.0.${i}` },
+            body: minimalIntelligenceBody(),
+          });
+          statuses.push(res.status);
+        }
+        assert.deepEqual(statuses.slice(0, 3), [200, 200, 200], "the first three requests are within the limit");
+        assert.deepEqual(statuses.slice(3), [429, 429, 429], "a forged X-Forwarded-For must not reset the counter");
+      });
+    });
+  });
+});
+
+// The opt-in must still genuinely work, or a real deployment behind a
+// real proxy would lump every client into one bucket.
+test("106-2. with TRUST_PROXY enabled, distinct X-Forwarded-For clients are counted separately", async () => {
+  await withEnvVar("TRUST_PROXY", "1", async () => {
+    await withRateLimitEnv({ windowMs: 60_000, maxRequests: 1 }, async () => {
+      await withRunningServer(async ({ baseUrl }) => {
+        const callAs = (ip) =>
+          fetch(`${baseUrl}/api/intelligence`, {
+            method: "POST",
+            headers: { ...JSON_AUTH_HEADERS, "X-Forwarded-For": ip },
+            body: minimalIntelligenceBody(),
+          });
+
+        assert.equal((await callAs("203.0.113.7")).status, 200, "first client's single allowed request");
+        assert.equal((await callAs("203.0.113.7")).status, 429, "same client is limited");
+        assert.equal((await callAs("203.0.113.9")).status, 200, "a genuinely different client is not");
+      });
+    });
+  });
+});
+
+// Only truthy spellings enable it — a stray value must never silently
+// re-open the bypass.
+test("106-2b. TRUST_PROXY only counts as enabled for explicit truthy values", () => {
+  const { isProxyTrusted } = freshServerModule();
+  for (const value of ["1", "true", "TRUE", " yes ", "on"]) {
+    process.env.TRUST_PROXY = value;
+    assert.equal(isProxyTrusted(), true, `${JSON.stringify(value)} should enable proxy trust`);
+  }
+  for (const value of ["0", "false", "no", "off", "", "  ", "maybe"]) {
+    process.env.TRUST_PROXY = value;
+    assert.equal(isProxyTrusted(), false, `${JSON.stringify(value)} must not enable proxy trust`);
+  }
+  delete process.env.TRUST_PROXY;
+  assert.equal(isProxyTrusted(), false, "unset must not enable proxy trust");
+});
+
+// Regression guard for the run-store pollution this step fixed: the
+// real data/runs.jsonl must be byte-identical before and after a
+// request served with RUN_STORE_FILE pointed elsewhere.
+test("106-3. no request served by this suite appends to the production data/runs.jsonl", async () => {
+  const { RUNS_FILE } = require("./data/runStore");
+  const sizeBefore = fs.existsSync(RUNS_FILE) ? fs.statSync(RUNS_FILE).size : null;
+
+  await withEnvVar("RUN_STORE_FILE", TEST_RUNS_FILE, async () => {
+    await withRunningServer(async ({ baseUrl }) => {
+      const res = await fetch(`${baseUrl}/api/intelligence`, { method: "POST", headers: AUTH_HEADERS });
+      assert.equal(res.status, 200);
+      assert.equal((await res.json()).persistence.status, "PERSISTED");
+    });
+  });
+
+  const sizeAfter = fs.existsSync(RUNS_FILE) ? fs.statSync(RUNS_FILE).size : null;
+  assert.equal(sizeAfter, sizeBefore, "the production run store must be untouched by tests");
+});
+
+// An explicit per-request runStore override must still beat the
+// server-level default, so no existing caller changes behavior.
+test("106-4. a body-supplied options.runStore still overrides RUN_STORE_FILE", async () => {
+  const bodyPath = path.join(os.tmpdir(), `server-test-body-runs-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`);
+  const envPath = path.join(os.tmpdir(), `server-test-env-runs-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`);
+
+  try {
+    await withEnvVar("RUN_STORE_FILE", envPath, async () => {
+      await withRunningServer(async ({ baseUrl }) => {
+        const res = await fetch(`${baseUrl}/api/intelligence`, {
+          method: "POST",
+          headers: JSON_AUTH_HEADERS,
+          body: minimalIntelligenceBody({ options: { runStore: { filePath: bodyPath } } }),
+        });
+        assert.equal(res.status, 200);
+      });
+    });
+
+    assert.equal(fs.existsSync(bodyPath), true, "the body-supplied path received the record");
+    assert.equal(fs.existsSync(envPath), false, "the environment default was not used");
+  } finally {
+    for (const p of [bodyPath, envPath]) {
+      try {
+        fs.unlinkSync(p);
+      } catch {
+        // Already absent.
+      }
+    }
+  }
 });

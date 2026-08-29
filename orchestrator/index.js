@@ -117,6 +117,41 @@ function validateInputs(request) {
   return { ok: errors.length === 0, warnings, errors };
 }
 
+// PER-DOMAIN FRESHNESS (Step 106). core/freshness.js needs a
+// { freshMaxMs, agingMaxMs } pair, and every specialist reads it from
+// the SAME shared options object this orchestrator hands out — which
+// meant one single window had to cover news, macro, candles and
+// sentiment at once, even though config/freshness.js correctly defines
+// a different, evidence-based window per domain. A 30-day macro window
+// applied to a news headline would call a three-week-old article
+// FRESH; that is exactly the kind of quietly-wrong signal this project
+// exists to avoid.
+//
+// The fix is this one helper. When a caller supplies
+// options.freshnessThresholdsByDomain — a plain map keyed by the
+// domain names below — each specialist is handed ITS OWN window
+// instead of the shared one. Rules, deliberately strict:
+//   - A domain PRESENT in the map gets that map's value.
+//   - A domain ABSENT from the map gets `undefined`, which
+//     core/freshness.js already resolves to FRESHNESS_STATES.UNKNOWN.
+//     It is never quietly given another domain's window: an honest
+//     UNKNOWN beats a confidently wrong FRESH.
+//   - No map supplied at all -> the shared options object is passed
+//     through completely untouched, so every existing caller and test
+//     that only sets options.freshnessThresholds behaves exactly as
+//     before.
+// Entrypoints (app.js, providers/marketIntelligenceApplicationService.js)
+// only build this map when the caller supplied no explicit
+// options.freshnessThresholds of their own, so an explicit caller
+// value is still never overridden.
+const FRESHNESS_DOMAINS = Object.freeze(["marketData", "news", "macro", "technical", "sentiment"]);
+
+function optionsForDomain(options = {}, domain) {
+  const byDomain = options.freshnessThresholdsByDomain;
+  if (!byDomain || typeof byDomain !== "object") return options;
+  return { ...options, freshnessThresholds: byDomain[domain] };
+}
+
 // Runs the Data Controller on request.marketData if supplied (see the
 // module header for why this is the ONLY payload that goes through it),
 // and shapes the raw per-specialist payloads + shared options. Nothing
@@ -125,7 +160,7 @@ function validateInputs(request) {
 function prepareAgentInputs(request, options = {}) {
   let dataControllerOutcome = null;
   if (Array.isArray(request.marketData) && request.marketData.length > 0) {
-    dataControllerOutcome = runDataController(request.marketData, options);
+    dataControllerOutcome = runDataController(request.marketData, optionsForDomain(options, "marketData"));
   }
 
   return {
@@ -149,18 +184,18 @@ function dispatchSpecialists(prepared) {
   const errors = [];
 
   const jobs = [
-    ["news", () => runNewsAgent(prepared.newsInput, prepared.sharedOptions)],
+    ["news", () => runNewsAgent(prepared.newsInput, optionsForDomain(prepared.sharedOptions, "news"))],
     [
       "macro",
       () =>
         runMacroAgent(prepared.macroInput, {
-          ...prepared.sharedOptions,
+          ...optionsForDomain(prepared.sharedOptions, "macro"),
           upcomingEvents: prepared.upcomingEvents,
           centralBankEvents: prepared.centralBankEvents,
         }),
     ],
-    ["technical", () => runTechnicalAgent(prepared.technicalInput, prepared.sharedOptions)],
-    ["sentiment", () => runSentimentAgent(prepared.sentimentInput, prepared.sharedOptions)],
+    ["technical", () => runTechnicalAgent(prepared.technicalInput, optionsForDomain(prepared.sharedOptions, "technical"))],
+    ["sentiment", () => runSentimentAgent(prepared.sentimentInput, optionsForDomain(prepared.sharedOptions, "sentiment"))],
   ];
 
   for (const [key, job] of jobs) {
@@ -373,6 +408,8 @@ function processRequest(request) {
 }
 
 module.exports = {
+  FRESHNESS_DOMAINS,
+  optionsForDomain,
   receiveRequest,
   identifyAsset,
   validateInputs,

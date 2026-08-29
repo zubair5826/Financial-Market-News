@@ -34,7 +34,7 @@
 // additive `persistence` field — see data/runStore.js for exactly why
 // a persistence failure never fails the request.
 const { runFredAwareRequest } = require("./providers/fredMacroApplicationService");
-const { getFreshnessThresholds } = require("./config/freshness");
+const { getFreshnessThresholds, getFreshnessThresholdsByPipelineDomain } = require("./config/freshness");
 const { persistRun, buildRunRecord } = require("./data/runStore");
 const crypto = require("crypto");
 
@@ -58,8 +58,29 @@ const crypto = require("crypto");
 // options.
 async function runApplicationRequest(request, options = {}) {
   const requestOptions = (request && request.options) || {};
-  const freshnessThresholds = requestOptions.freshnessThresholds || getFreshnessThresholds("macro");
-  const requestWithFreshness = { ...request, options: { ...requestOptions, freshnessThresholds } };
+
+  // Step 106: an explicit caller-supplied freshnessThresholds is still
+  // preserved exactly as-is and is never joined by a per-domain map —
+  // an explicit value must stay the single authority for that run
+  // (Step 100's own rule, unchanged). Only when the caller supplied
+  // nothing do we fill in BOTH:
+  //   - freshnessThresholds: the macro window, unchanged from Step 100,
+  //     so any consumer reading this one flat field (and any domain
+  //     the map below deliberately leaves out) behaves as before; and
+  //   - freshnessThresholdsByDomain: the correct per-domain windows,
+  //     which orchestrator/index.js's optionsForDomain() applies to
+  //     each specialist individually. Without this, a news headline
+  //     travelling through this entrypoint was measured against the
+  //     30-day MACRO window and reported FRESH when it was weeks old.
+  const callerSuppliedThresholds = requestOptions.freshnessThresholds;
+  const resolvedOptions = callerSuppliedThresholds
+    ? { ...requestOptions }
+    : {
+        ...requestOptions,
+        freshnessThresholds: getFreshnessThresholds("macro"),
+        freshnessThresholdsByDomain: getFreshnessThresholdsByPipelineDomain(),
+      };
+  const requestWithFreshness = { ...request, options: resolvedOptions };
 
   const { pipelineResult, fredDiagnostics } = await runFredAwareRequest(requestWithFreshness, options);
 

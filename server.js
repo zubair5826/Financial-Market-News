@@ -39,17 +39,25 @@
 //     EXCEPT /health, and applied BEFORE route lookup/method/auth
 //     checks — so a client cannot dodge the limiter by hitting an
 //     unknown path, the wrong method, or a malformed body; every one
-//     of those still counts against its IP first. The client IP
-//     prefers X-Forwarded-For's first entry (Railway's own proxy sets
-//     this reliably) and falls back to the raw socket address for
-//     direct/local connections (tests). KNOWN LIMITATION, disclosed
-//     rather than hidden: X-Forwarded-For is caller-suppliable and
-//     only trustworthy when this process truly sits behind a proxy
-//     that overwrites it (as Railway's does) — if this server is ever
-//     exposed directly to the internet without such a proxy in front
-//     of it, that header could be forged to evade per-IP limiting.
-//     "Basic" per the spec, not a defense against a determined
-//     attacker with direct access.
+//     of those still counts against its IP first.
+//
+//     CLIENT IP / X-Forwarded-For (fixed in Step 106): this previously
+//     ALWAYS preferred X-Forwarded-For's first entry. That header is
+//     caller-suppliable, so any client could send a different fake
+//     value on every request and land in a fresh rate-limit bucket
+//     each time — the limiter was fully bypassable. Verified in
+//     practice, not in theory: with a limit of 3/min, six requests
+//     carrying six different X-Forwarded-For values all returned 200.
+//     X-Forwarded-For is now read ONLY when TRUST_PROXY is explicitly
+//     enabled in the environment, which is a promise by the operator
+//     that a proxy in front of this process OVERWRITES that header
+//     (Railway, nginx, a cloud load balancer all do). Default is OFF —
+//     fail-closed: with it off, a forged header is ignored and every
+//     direct client is counted by its real socket address. The cost of
+//     the safe default is that behind a proxy WITHOUT TRUST_PROXY set,
+//     all traffic shares the proxy's single IP bucket (over-limiting,
+//     never under-limiting), which is the correct direction to fail.
+//     Set TRUST_PROXY=1 on Railway or any similar platform.
 //   - /health stays completely open (no auth, no rate limit) — Step
 //     105 requirement 1/8 — so Railway's own health checks are never
 //     blocked or throttled by either mechanism.
@@ -61,6 +69,31 @@ const { runPortfolioIntelligenceRequest } = require("./portfolioIntelligence");
 const { logEvent } = require("./logs/logger");
 
 const PORT = process.env.PORT || 3000;
+
+// Step 106: the network interface this process binds to. Defaults to
+// loopback ONLY — a server carrying real API credentials must never
+// become reachable from the whole network just because someone ran
+// `npm start` on a machine with a public IP. Container and cloud
+// platforms (Railway included) route to the container's external
+// interface and therefore REQUIRE HOST=0.0.0.0; that is a deliberate,
+// one-line, documented opt-in (.env.example, HOW_TO_RUN.md) rather
+// than an unsafe default. The startup banner below says so explicitly
+// so the requirement can never be discovered only by a failed deploy.
+const HOST = process.env.HOST || "127.0.0.1";
+
+// Step 106: where data/runStore.js writes this server's run records.
+// Production leaves it unset (data/runs.jsonl, runStore.js's own
+// default). It exists because server.test.js's "empty POST body" case
+// has no body in which to carry options.runStore — so before this,
+// running `npm test` appended one real record to the production run
+// store, quietly mixing synthetic test rows into the very history the
+// store exists to make measurable. That test now sets this variable
+// instead. Also genuinely useful in deployment: it lets an operator
+// point run records at a mounted volume without touching code.
+function getRunStoreOptions() {
+  const filePath = process.env.RUN_STORE_FILE;
+  return typeof filePath === "string" && filePath.trim() ? { runStore: { filePath: filePath.trim() } } : {};
+}
 
 // A generous but bounded limit — protects the process from an
 // unbounded-body request without imposing any new limit on the
@@ -126,10 +159,30 @@ const RATE_LIMIT_MAX_REQUESTS = readPositiveIntEnv("RATE_LIMIT_MAX_REQUESTS", 30
 // this can't grow without bound over a long-running process.
 const rateLimitBuckets = new Map();
 
+// TRUST_PROXY is read fresh on every call (never cached at module
+// load) for the same reason the auth token is: a test — and an
+// operator on a platform with live env reload — can flip it without a
+// process restart. Accepted truthy spellings are explicit; anything
+// else, including an unset value, means "do not trust the header".
+const TRUSTED_PROXY_VALUES = new Set(["1", "true", "yes", "on"]);
+
+function isProxyTrusted() {
+  const raw = process.env.TRUST_PROXY;
+  return typeof raw === "string" && TRUSTED_PROXY_VALUES.has(raw.trim().toLowerCase());
+}
+
+// The raw socket address is the only value a client cannot forge, so
+// it is the default and the fallback. X-Forwarded-For is consulted
+// ONLY under an explicit operator opt-in (see the Step 106 note in the
+// module header) and only for its first, left-most entry — the
+// original client as every standard proxy writes it.
 function getClientIp(req) {
-  const forwarded = req.headers["x-forwarded-for"];
-  if (typeof forwarded === "string" && forwarded.trim()) {
-    return forwarded.split(",")[0].trim();
+  if (isProxyTrusted()) {
+    const forwarded = req.headers["x-forwarded-for"];
+    if (typeof forwarded === "string" && forwarded.trim()) {
+      const firstEntry = forwarded.split(",")[0].trim();
+      if (firstEntry) return firstEntry;
+    }
   }
   return (req.socket && req.socket.remoteAddress) || "unknown";
 }
@@ -293,7 +346,11 @@ async function handleIntelligence(req, res) {
     return sendJson(res, 400, { error: "\"request\" and \"options\", if present, must be JSON objects." });
   }
 
-  const result = await runApplicationRequest(requestArg, optionsArg);
+  // Step 106: a server-level RUN_STORE_FILE (when configured) supplies
+  // the default run-store path; an explicit body-supplied
+  // options.runStore still wins, so no existing caller changes
+  // behavior.
+  const result = await runApplicationRequest(requestArg, { ...getRunStoreOptions(), ...optionsArg });
   return sendJson(res, 200, result);
 }
 
@@ -420,11 +477,17 @@ function shutdown(signal) {
 }
 
 if (require.main === module) {
-  server.listen(PORT, () => {
-    console.log(`Server listening on port ${PORT}`);
+  server.listen(PORT, HOST, () => {
+    console.log(`Server listening on ${HOST}:${PORT}`);
+    if (HOST === "127.0.0.1" || HOST === "localhost") {
+      console.log("Bound to loopback only. Set HOST=0.0.0.0 to accept connections from outside this machine (required on Railway and other container platforms).");
+    }
+    if (!isProxyTrusted()) {
+      console.log("TRUST_PROXY is off: X-Forwarded-For is ignored and rate limiting counts the direct socket address. Set TRUST_PROXY=1 only when a proxy in front of this process overwrites that header.");
+    }
   });
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
 }
 
-module.exports = { server, requestListener, shutdown, MAX_BODY_BYTES, RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_REQUESTS };
+module.exports = { server, requestListener, shutdown, getClientIp, isProxyTrusted, getRunStoreOptions, MAX_BODY_BYTES, RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_REQUESTS, HOST };

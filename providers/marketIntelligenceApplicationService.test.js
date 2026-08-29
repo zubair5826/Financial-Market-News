@@ -823,3 +823,78 @@ test.after(() => {
   orchestratorModule.processRequest = originalProcessRequest;
   global.setTimeout = originalSetTimeout;
 });
+
+// --- Step 106: this path now applies the centralized freshness policy ---
+
+// The defect this closes: app.js supplied freshnessThresholds for the
+// FRED-only entrypoint, but THIS service — the one runLive.js uses,
+// and the only one that pulls live candles and live news — never set
+// them at all. core/freshness.js therefore reported UNKNOWN for every
+// record and the Risk Manager's stale-data signal could not fire on
+// the very path that handles real market data.
+test("106-15. with every domain disabled, the centralized freshness policy is still applied to caller-supplied payloads", async () => {
+  const threeWeeksAgo = new Date(Date.now() - 21 * 24 * 60 * 60 * 1000).toISOString();
+  const request = validBaseRequest({
+    newsData: [
+      {
+        asset: "SPY",
+        headline: "Three-week-old headline",
+        classification: "FACT",
+        source: "news-src-A",
+        publication_timestamp: threeWeeksAgo,
+        impact_direction: "POSITIVE",
+        verification_status: "VERIFIED_PRIMARY",
+      },
+    ],
+  });
+
+  const { pipelineResult } = await runMarketIntelligenceRequest(request, {});
+  const staleWarnings = pipelineResult.warnings.filter((w) => w && typeof w === "object" && w.code === ERROR_CODES.STALE_DATA);
+
+  assert.equal(staleWarnings.length, 1, "the stale headline is detected; before Step 106 freshness was UNKNOWN here");
+  assert.match(staleWarnings[0].message, /Three-week-old headline/);
+});
+
+// Behavioral proof rather than interception: this file deliberately
+// wraps orchestrator.processRequest BEFORE the service is required
+// (see the header), and the service captured that binding by value, so
+// a later re-patch would never be seen. A two-hour-old headline
+// discriminates cleanly instead: under the centralized NEWS policy
+// (fresh 1h / aging 24h) it is AGING, not stale; under the caller's
+// own tiny window (fresh 1m / aging 1h) it is STALE. Seeing STALE
+// proves the caller's value, not the policy, was used.
+test("106-16. an explicit caller-supplied freshnessThresholds is never replaced on this path either", async () => {
+  const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+  const tinyThreshold = { freshMaxMs: 60 * 1000, agingMaxMs: 60 * 60 * 1000 };
+  const newsData = [
+    {
+      asset: "SPY",
+      headline: "Two-hour-old headline",
+      classification: "FACT",
+      source: "news-src-A",
+      publication_timestamp: twoHoursAgo,
+      impact_direction: "POSITIVE",
+      verification_status: "VERIFIED_PRIMARY",
+    },
+  ];
+
+  const staleCount = (result) =>
+    result.pipelineResult.warnings.filter((w) => w && typeof w === "object" && w.code === ERROR_CODES.STALE_DATA).length;
+
+  const withCallerThreshold = await runMarketIntelligenceRequest(
+    validBaseRequest({ newsData, options: { freshnessThresholds: tinyThreshold } }),
+    {}
+  );
+  const withCentralPolicy = await runMarketIntelligenceRequest(validBaseRequest({ newsData }), {});
+
+  assert.equal(staleCount(withCallerThreshold), 1, "the caller's own 1-hour window must decide");
+  assert.equal(staleCount(withCentralPolicy), 0, "the centralized news window calls the same headline AGING, not STALE");
+});
+
+test("106-17. the caller's request and options objects are still never mutated by the freshness fix", async () => {
+  const request = validBaseRequest();
+  const snapshot = JSON.stringify(request);
+  await runMarketIntelligenceRequest(request, {});
+  assert.equal(JSON.stringify(request), snapshot);
+  assert.equal(request.options === undefined || request.options.freshnessThresholdsByDomain === undefined, true);
+});

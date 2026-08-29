@@ -345,9 +345,44 @@ made:
 `NODE_ENV` (documented in [.env.example](.env.example)) is the
 intended selector (`development` / `test` / `production`), read via
 `process.env.NODE_ENV` **only** at the point a future provider adapter
-or server entrypoint needs it — no code currently reads it, since no
-such entrypoint exists yet. **No real credentials exist in this repo
-in any environment.**
+or server entrypoint needs it — no code currently reads it. **No real
+credentials exist in this repo in any environment.**
+
+### Every environment variable this system reads
+
+| Variable | Read only in | Effect if unset |
+|---|---|---|
+| `FRED_API_KEY` | `providers/fredMacroLiveSource.js` | Macro live calls return `AUTH_FAILURE`; never fabricated data |
+| `ALPHAVANTAGE_API_KEY` | `providers/alphaVantage*LiveSource.js` | Market/news live calls return `AUTH_FAILURE` |
+| `API_AUTH_TOKEN` | `server.js` | **Fails closed** — every API request is rejected with 401 |
+| `PORT` | `server.js` | `3000` |
+| `HOST` | `server.js` | `127.0.0.1` (loopback only). Container/cloud platforms need `HOST=0.0.0.0` |
+| `TRUST_PROXY` | `server.js` | Off — `X-Forwarded-For` is ignored and rate limiting uses the real socket address. Set to `1` **only** behind a proxy that overwrites that header |
+| `RATE_LIMIT_WINDOW_MS` | `server.js` | `60000` |
+| `RATE_LIMIT_MAX_REQUESTS` | `server.js` | `30` |
+| `RUN_STORE_FILE` | `server.js` | `data/runs.jsonl` |
+
+## HTTP API (`server.js`)
+
+`npm start`. Three routes, no framework, no dependencies:
+
+| Route | Auth | Rate limited | Body |
+|---|---|---|---|
+| `GET /health` | none | no | — |
+| `POST /api/intelligence` | `Authorization: Bearer $API_AUTH_TOKEN` | yes | `{ request, options }` |
+| `POST /api/portfolio-intelligence` | same | yes | the request object itself |
+
+Security properties, each covered by tests in
+[server.test.js](server.test.js): the bearer comparison is
+length-normalized and timing-safe; every auth failure returns the same
+generic `401` regardless of cause; rate limiting runs before route
+lookup, method checks and body parsing, so it cannot be dodged by
+hitting an unknown path; `X-Forwarded-For` is honored only under an
+explicit `TRUST_PROXY` opt-in, so a forged header cannot open a fresh
+rate-limit bucket; internal errors never leak a message or stack.
+
+**This process does not terminate TLS.** Put it behind a reverse proxy
+or platform that does, and set `TRUST_PROXY=1` there.
 
 ## Security
 
@@ -452,19 +487,43 @@ see [Fail-Safe Guarantees](#fail-safe-guarantees)).
   (Alpha Vantage) and macro (FRED) are integrated; sentiment and
   the Data Controller's own domain remain `UNKNOWN` — not selected,
   not assumed.
-- **No HTTP server or CLI entrypoint.** `processRequest()` must be
-  called directly by a Node process; there is no way to reach this
-  system over a network yet.
-- **No persistence layer.** `data/` exists but is empty — no report
-  history, no request log beyond `logs/system.log`, is ever written.
+- **An HTTP API and CLI runners exist** ([server.js](server.js),
+  [runIntelligence.js](runIntelligence.js), [runLive.js](runLive.js),
+  [runPortfolioIntelligence.js](runPortfolioIntelligence.js)) — see
+  [HTTP API](#http-api-serverjs). The API requires a bearer token, is
+  rate-limited per client IP, and binds to loopback unless `HOST` says
+  otherwise.
+- **Run records are persisted** to `data/runs.jsonl` (one JSONL line
+  per completed run, credentials redacted — [data/runStore.js](data/runStore.js)).
+  What is NOT recorded is the market OUTCOME of a run: nothing in this
+  repository stores what actually happened afterwards, so system
+  accuracy still cannot be measured from these records alone. That is
+  the single biggest remaining gap in this project.
 - **No agent system prompts committed.** `prompts/` is an empty
   placeholder — this codebase is deterministic logic, not an LLM
-  agent, but if a future LLM-driven layer is added on top, its prompts
-  don't exist yet.
-- **Freshness/quality/confidence thresholds are all caller-supplied**
+  agent. A full design for a future LLM layer exists in
+  [LLM_REASONING_LAYER_DESIGN.md](LLM_REASONING_LAYER_DESIGN.md); no
+  part of it is implemented.
+- **Freshness thresholds are centralized but not calibrated.**
+  [config/freshness.js](config/freshness.js) defines a reasoned window
+  per domain (market / news / macro) and orchestrator/index.js applies
+  each to its own specialist. They are disclosed defaults derived from
+  each provider's actual publication cadence — not values tuned
+  against sustained real production traffic. Two pipeline domains
+  (`sentiment`, and the Data Controller's `marketData`) are
+  deliberately absent from that policy because neither has a chosen
+  provider; records in those domains honestly report `UNKNOWN`
+  freshness rather than borrowing another domain's window.
+- **FRED-sourced macro data can never report anything but `UNKNOWN`
+  freshness.** FRED publishes no genuine release timestamp, and
+  `providers/adapters/fredMacroAdapter.js` deliberately refuses to
+  derive one. A macro freshness window is still defined for any future
+  provider that does supply one, but in practice the stale-data signal
+  is inert for macro today. Correct, disclosed behavior — not a gap to
+  work around by inventing a timestamp.
+- **Quality/confidence thresholds elsewhere are still caller-supplied**
   with documented defaults in a few places (e.g. Trade Setup's quality
-  thresholds) — none represent a real-world-calibrated value; they
-  have not been tuned against sustained real production traffic.
+  thresholds) — none represent a real-world-calibrated value.
 - **No automatic or manual trade execution, anywhere, under any
   configuration.** This system produces decision *intelligence*
   (bias, setup, risk, and decision-status labels) — it has no code
@@ -482,8 +541,9 @@ see [Fail-Safe Guarantees](#fail-safe-guarantees)).
 - `tests/` — cross-cutting contract, orchestrator, and end-to-end
   pipeline tests. **IMPLEMENTED.** (Per-agent unit tests live alongside
   each agent in `agents/<agent-name>/*.test.js`.)
-- `data/` — reserved for future persisted output. **NOT IMPLEMENTED**
-  (empty).
+- `config/` — centralized freshness policy. **IMPLEMENTED.**
+- `data/` — persisted run records (`runs.jsonl`, gitignored) plus
+  `runStore.js`. **IMPLEMENTED.**
 - `prompts/` — reserved for future agent system prompts. **NOT
   IMPLEMENTED** (empty).
 

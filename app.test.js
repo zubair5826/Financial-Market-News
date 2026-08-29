@@ -10,7 +10,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { runApplicationRequest } = require("./app");
-const { FRESHNESS_POLICY, getFreshnessThresholds } = require("./config/freshness");
+const { FRESHNESS_POLICY, getFreshnessThresholds, getFreshnessThresholdsByPipelineDomain } = require("./config/freshness");
 
 // Step 102: a throwaway temp path so these tests never append to the
 // real data/runs.jsonl. Passed via options.runStore.filePath — see
@@ -472,4 +472,72 @@ test("102-8. the intelligence decision itself is identical whether persistence s
     cleanupFile(goodFilePath);
     cleanupFile(blockerFile);
   }
+});
+
+// --- Step 106: per-domain freshness reaches each specialist ---
+
+// Step 100 gave this entrypoint ONE window (the macro one) and handed
+// it to all four specialists. Correct for a FRED release, wrong for a
+// news headline — a three-week-old article read FRESH. Step 106 adds
+// the per-domain map alongside it; the flat value is kept so any
+// consumer reading that single field, and any domain deliberately
+// absent from the map, behaves exactly as before.
+test("106-12. omitting freshnessThresholds now also supplies the per-domain policy map", async () => {
+  const filePath = tempRunsFile();
+  try {
+    await runApplicationRequest(validBaseRequest(), { runStore: { filePath } });
+    const [record] = readJsonlLines(filePath);
+    const options = record.normalized_request.options;
+
+    assert.deepEqual(options.freshnessThresholds, FRESHNESS_POLICY.macro, "the flat macro default is still supplied");
+    assert.deepEqual(options.freshnessThresholdsByDomain, getFreshnessThresholdsByPipelineDomain());
+  } finally {
+    fs.rmSync(filePath, { force: true });
+  }
+});
+
+test("106-13. an explicit caller threshold stays the sole authority — no per-domain map is added alongside it", async () => {
+  const filePath = tempRunsFile();
+  const tinyThreshold = { freshMaxMs: 60 * 1000, agingMaxMs: 60 * 60 * 1000 };
+  try {
+    await runApplicationRequest(
+      validBaseRequest({ options: { freshnessThresholds: tinyThreshold } }),
+      { runStore: { filePath } }
+    );
+    const [record] = readJsonlLines(filePath);
+    const options = record.normalized_request.options;
+
+    assert.deepEqual(options.freshnessThresholds, tinyThreshold);
+    assert.equal(options.freshnessThresholdsByDomain, undefined, "an explicit threshold is never silently supplemented");
+  } finally {
+    fs.rmSync(filePath, { force: true });
+  }
+});
+
+// The behavioral consequence, end to end through this entrypoint: a
+// three-week-old headline is now measured against the NEWS window and
+// reported STALE, while an equally old macro release stays FRESH under
+// its own 30-day window.
+test("106-14. a three-week-old news headline is STALE through this entrypoint while an equally old macro release is not", async () => {
+  const threeWeeksAgo = isoDaysAgo(21);
+  const request = validBaseRequest({
+    macroData: [macroRecord({ release_timestamp: threeWeeksAgo })],
+    newsData: [
+      {
+        asset: "US",
+        headline: "Three-week-old headline",
+        classification: "FACT",
+        source: "news-src-A",
+        publication_timestamp: threeWeeksAgo,
+        impact_direction: "POSITIVE",
+        verification_status: "VERIFIED_PRIMARY",
+      },
+    ],
+  });
+
+  const result = await runApplicationRequest(request, withRunStore());
+  const staleWarnings = result.pipelineResult.warnings.filter((w) => w && typeof w === "object" && w.code === "STALE_DATA");
+
+  assert.equal(staleWarnings.length, 1, "exactly the news record is stale");
+  assert.match(staleWarnings[0].message, /Three-week-old headline/);
 });

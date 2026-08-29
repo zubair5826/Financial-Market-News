@@ -22,6 +22,7 @@ const { loadLiveNewsData } = require("./alphaVantageNewsLiveSource");
 const { processRequest } = require("../orchestrator");
 const { failSafe, ERROR_CODES } = require("../core/errors");
 const { resolveInstrumentContext, UNKNOWN: INSTRUMENT_UNKNOWN } = require("./instrumentContext");
+const { getFreshnessThresholds, getFreshnessThresholdsByPipelineDomain } = require("../config/freshness");
 const { ALPHA_VANTAGE_INTER_REQUEST_DELAY_MS, delay } = require("./alphaVantageRateLimit");
 
 const DEFAULT_MACRO_SERIES_IDS = ["GNPCA"];
@@ -58,6 +59,30 @@ async function acquireAlphaVantage(marketEnabled, newsEnabled, options, symbol) 
   }
   const newsResult = newsEnabled ? await loadLiveNewsData({ symbol, adapterConfig: options.newsAdapterConfig }) : null;
   return { marketResult, newsResult };
+}
+
+// Step 106 fix: this multi-domain live path never set
+// request.options.freshnessThresholds at all. app.js does it for the
+// FRED-only entrypoint, but runLive.js and every other caller of THIS
+// function ran with no threshold configured, so core/freshness.js
+// honestly reported UNKNOWN for every record and the Risk Manager's
+// stale-data signal could never fire on the one path that actually
+// pulls live candles and live news. Same rule as app.js: an explicit
+// caller-supplied freshnessThresholds is never touched; otherwise both
+// the flat macro default and the correct per-domain map are filled in
+// (orchestrator/index.js's optionsForDomain() applies the latter
+// per specialist). Never mutates the caller's request or options.
+function withFreshnessPolicy(request) {
+  const requestOptions = (request && request.options) || {};
+  if (requestOptions.freshnessThresholds) return request;
+  return {
+    ...request,
+    options: {
+      ...requestOptions,
+      freshnessThresholds: getFreshnessThresholds("macro"),
+      freshnessThresholdsByDomain: getFreshnessThresholdsByPipelineDomain(),
+    },
+  };
 }
 
 function rejectAmbiguousMerge(fieldName) {
@@ -111,7 +136,10 @@ async function runMarketIntelligenceRequest(request, options = {}) {
     // No domain enabled: identical to calling processRequest() directly
     // — no provider is ever touched, request.* payloads (if any) pass
     // through untouched, same convention as FRED's own disabled path.
-    const pipelineResult = processRequest(request);
+    // Freshness policy is still applied (Step 106): a caller-supplied
+    // payload deserves the same honest freshness evaluation as a
+    // provider-supplied one.
+    const pipelineResult = processRequest(withFreshnessPolicy(request));
     return { pipelineResult, diagnostics: null };
   }
 
@@ -155,7 +183,7 @@ async function runMarketIntelligenceRequest(request, options = {}) {
 
   // Exactly ONE processRequest() call for the whole composed run —
   // never one per provider (Step 46A hard invariant).
-  const pipelineResult = processRequest(mergedRequest);
+  const pipelineResult = processRequest(withFreshnessPolicy(mergedRequest));
 
   const diagnostics = {
     // Exposed so a caller can see exactly which instrument context was

@@ -65,4 +65,42 @@ function getFreshnessThresholds(domain) {
   return FRESHNESS_POLICY[domain];
 }
 
-module.exports = { FRESHNESS_POLICY, getFreshnessThresholds };
+// --- Step 106: per-pipeline-domain mapping -------------------------
+//
+// FRESHNESS_POLICY above is keyed by DATA domain ("market", "news",
+// "macro"). orchestrator/index.js hands options to agents keyed by
+// PIPELINE domain ("marketData", "news", "macro", "technical",
+// "sentiment"). This map is the single, explicit translation between
+// the two — so no caller has to remember that the Technical Agent is
+// fed by the "market" policy.
+//
+// Two pipeline domains are DELIBERATELY absent, and must stay absent
+// until each has a real chosen provider whose timestamp field and
+// publication cadence can actually be inspected (the same standard
+// every entry above was held to):
+//   - "sentiment"  — no sentiment provider has been selected.
+//   - "marketData" — the Data Controller's own generic value domain
+//                    has no selected provider either (README.md).
+// Inventing a window for either would be exactly the fabrication this
+// project refuses to do. orchestrator/index.js's optionsForDomain()
+// resolves an absent domain to `undefined`, which core/freshness.js
+// already reports honestly as UNKNOWN.
+const FRESHNESS_POLICY_BY_PIPELINE_DOMAIN = Object.freeze({
+  news: FRESHNESS_POLICY.news,
+  macro: FRESHNESS_POLICY.macro,
+  technical: FRESHNESS_POLICY.market,
+});
+
+// Returns the frozen pipeline-domain map above. A function (rather
+// than exporting the constant alone) so every entrypoint has one
+// obvious, greppable call site, mirroring getFreshnessThresholds().
+function getFreshnessThresholdsByPipelineDomain() {
+  return FRESHNESS_POLICY_BY_PIPELINE_DOMAIN;
+}
+
+module.exports = {
+  FRESHNESS_POLICY,
+  FRESHNESS_POLICY_BY_PIPELINE_DOMAIN,
+  getFreshnessThresholds,
+  getFreshnessThresholdsByPipelineDomain,
+};
