@@ -1,0 +1,43 @@
+# Continuous integration — Step 106.
+#
+# Until now nothing ran this project's test suite except a human
+# remembering to type `npm test`. A green suite on one laptop is not a
+# deployment gate; this makes every push and every pull request run the
+# full suite on a clean machine.
+#
+# Deliberately minimal, matching the project's zero-dependency rule:
+# no test-reporter action, no coverage service, no cache — `npm test`
+# is `node --test`, needs no install step, and never makes a network
+# call or reads a credential.
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 18 is the floor declared in package.json's engines field; 22
+        # is what development actually runs on. Both must stay green.
+        node-version: ["18", "22"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Run the test suite
+        run: npm test
+      - name: Fail if the test suite wrote to the production run store
+        # data/runs.jsonl is gitignored and must never be created by a
+        # test run (Step 106 fixed the one test that did). If it exists
+        # after `npm test`, a test is polluting real run history.
+        run: |
+          if [ -f data/runs.jsonl ]; then
+            echo "::error::npm test wrote to data/runs.jsonl — a test is not redirecting its run store."
+            exit 1
+          fi
