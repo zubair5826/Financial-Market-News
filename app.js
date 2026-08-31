@@ -33,9 +33,33 @@
 // succeeds or fails. Its outcome is reported back only as a new,
 // additive `persistence` field — see data/runStore.js for exactly why
 // a persistence failure never fails the request.
+//
+// Step 5D: this is also the exact wiring point
+// LLM_REASONING_LAYER_DESIGN.md §0 proposes for the isolated Claude
+// reasoning layer — "one more optional post-processing call, in the
+// same place and style as Step 102's persistence hook — after
+// runFredAwareRequest() resolves, before the response is returned."
+// Disabled unless the caller's own options.llm.enabled === true
+// (mirroring options.macro.enabled exactly, same frozen non-negotiable
+// default). When run, it operates ONLY on the already-complete
+// pipelineResult — it runs strictly after processRequest()/the Risk
+// Manager/the Chief Trading Manager have already produced their final
+// result, never influences any of them, and can never mutate
+// pipelineResult (llm/reasoningService.js takes it read-only and
+// llm/evidencePackage.js's own output is deep-frozen). Any failure —
+// network, timeout, auth, rate limit, malformed response, schema
+// validation, grounding/hallucination, or a risk-override attempt —
+// is reported only via the additive `llmAnnotation` field below;
+// pipelineResult is returned byte-for-byte identical either way, the
+// same non-negotiable guarantee Step 102 already established for
+// persistence failures. Persistence (data/runStore.js) is
+// deliberately NOT modified by this step — §12's run-record
+// llm_annotation field is a separate, not-yet-authorized extension of
+// persistence, out of scope for this integration-wiring step.
 const { runFredAwareRequest } = require("./providers/fredMacroApplicationService");
 const { getFreshnessThresholds, getFreshnessThresholdsByPipelineDomain } = require("./config/freshness");
 const { persistRun, buildRunRecord } = require("./data/runStore");
+const { runReasoningService } = require("./llm/reasoningService");
 const crypto = require("crypto");
 
 // request: the same shape processRequest() already accepts (see
@@ -51,10 +75,20 @@ const crypto = require("crypto");
 // options.runStore, if present, is forwarded only to persistRun() (see
 // data/runStore.js) — its one field, filePath, exists solely for
 // offline test injection so tests never append to the real
-// data/runs.jsonl; production callers never set it. Returns
-// { pipelineResult, fredDiagnostics, persistence } — the first two
-// fields unchanged from before Step 102; `persistence` is new (see
-// module comment above). Never mutates the caller's request or
+// data/runs.jsonl; production callers never set it.
+// options.llm: { enabled?: boolean, adapterConfig?: object } — the
+// Claude reasoning layer is disabled unless enabled === true (frozen,
+// non-negotiable default, exactly like options.macro). adapterConfig
+// exists solely for offline test injection (a synthetic fetchImpl/
+// timeoutMs), mirroring options.adapterConfig's existing FRED
+// convention; production callers never set it. Returns
+// { pipelineResult, fredDiagnostics, persistence, llmAnnotation } —
+// the first three fields unchanged from before Step 5D;
+// `llmAnnotation` is new (see module comment above) and is `null`
+// whenever the LLM layer wasn't enabled for this run — indistinguishable
+// from "not yet built" for any existing caller that doesn't look at
+// it, the same additive-field precedent `persistence` and
+// `fredDiagnostics` already set. Never mutates the caller's request or
 // options.
 async function runApplicationRequest(request, options = {}) {
   const requestOptions = (request && request.options) || {};
@@ -84,8 +118,9 @@ async function runApplicationRequest(request, options = {}) {
 
   const { pipelineResult, fredDiagnostics } = await runFredAwareRequest(requestWithFreshness, options);
 
+  const runId = crypto.randomUUID();
   const runRecord = buildRunRecord({
-    runId: crypto.randomUUID(),
+    runId,
     originalRequest: request,
     normalizedRequest: requestWithFreshness,
     pipelineResult,
@@ -93,7 +128,53 @@ async function runApplicationRequest(request, options = {}) {
   });
   const persistence = await persistRun(runRecord, options.runStore || {});
 
-  return { pipelineResult, fredDiagnostics, persistence };
+  // Step 5D: strictly after the deterministic pipeline result above
+  // already exists and has already been queued for persistence. On
+  // any failure inside runReasoningService() (network, timeout, auth,
+  // rate limit, malformed response, schema validation, grounding, or a
+  // risk-override attempt), llmAnnotation reports a non-VALID status —
+  // pipelineResult itself is never touched, above or below this line.
+  const llmOptions = (options && options.llm) || {};
+  let llmAnnotation = null;
+  if (llmOptions.enabled === true) {
+    // Hardening (post-Step-5D audit finding): runReasoningService()
+    // already reports every KNOWN failure mode (network/timeout/auth/
+    // rate-limit/5xx/malformed-response/schema/grounding/risk-override)
+    // as a structured, non-throwing result. This try/catch exists
+    // ONLY for an UNEXPECTED exception outside that contract — a bug,
+    // not a documented failure mode — so it can never reject this
+    // function and take the already-complete pipelineResult down with
+    // it. Mirrors orchestrator/index.js's dispatchSpecialists(), which
+    // guards each specialist call the same way and for the same
+    // reason. err itself (message/stack) is deliberately NEVER read
+    // into llmAnnotation — only a fixed, generic string is ever
+    // surfaced, so there is no path by which a credential or secret
+    // that happened to be interpolated deep in a thrown error could
+    // leak out through this boundary.
+    try {
+      const reasoningResult = await runReasoningService(pipelineResult, request, {
+        runId,
+        llmConfig: llmOptions.adapterConfig,
+      });
+      llmAnnotation = {
+        status: reasoningResult.status,
+        output: reasoningResult.output,
+        code: reasoningResult.code,
+        message: reasoningResult.message,
+        errors: reasoningResult.errors,
+      };
+    } catch {
+      llmAnnotation = {
+        status: "UNAVAILABLE",
+        output: null,
+        code: "API_UNAVAILABLE",
+        message: "The LLM reasoning layer failed unexpectedly.",
+        errors: [],
+      };
+    }
+  }
+
+  return { pipelineResult, fredDiagnostics, persistence, llmAnnotation };
 }
 
 module.exports = { runApplicationRequest };

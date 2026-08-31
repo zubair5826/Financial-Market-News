@@ -98,8 +98,11 @@ test("2. runIntelligence calls the existing app.js entrypoint (no credential -> 
       );
       assert.equal(networkCalled, false);
       // Step 102: the contract gained one new, additive field —
-      // `persistence` — see app.js/data/runStore.js.
-      assert.deepEqual(Object.keys(result).sort(), ["fredDiagnostics", "persistence", "pipelineResult"]);
+      // `persistence` — see app.js/data/runStore.js. Step 5D added a
+      // second additive field, `llmAnnotation` (null here since the
+      // LLM layer is disabled by default) — see app.js/llm/reasoningService.js.
+      assert.deepEqual(Object.keys(result).sort(), ["fredDiagnostics", "llmAnnotation", "persistence", "pipelineResult"]);
+      assert.equal(result.llmAnnotation, null);
       assert.equal(result.pipelineResult.ok, true);
       assert.ok(result.fredDiagnostics); // FRED path was reached (enabled:true), just returned empty due to missing credential
       assert.deepEqual(result.fredDiagnostics.warnings, ["FRED_API_KEY not configured."]);

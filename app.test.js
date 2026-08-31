@@ -135,11 +135,13 @@ test("2/4. FRED disabled by default: request reaches the pipeline, contract is {
   assert.equal(networkCalled, false);
   // Step 102: the contract gained one new, additive field —
   // `persistence` — reporting the outcome of writing this run to
-  // data/runs.jsonl. pipelineResult/fredDiagnostics themselves are
-  // untouched.
-  assert.deepEqual(Object.keys(result).sort(), ["fredDiagnostics", "persistence", "pipelineResult"]);
+  // data/runs.jsonl. Step 5D added a second additive field,
+  // `llmAnnotation` (null here since the LLM layer is disabled by
+  // default). pipelineResult/fredDiagnostics themselves are untouched.
+  assert.deepEqual(Object.keys(result).sort(), ["fredDiagnostics", "llmAnnotation", "persistence", "pipelineResult"]);
   assert.equal(result.pipelineResult.ok, true);
   assert.equal(result.fredDiagnostics, null);
+  assert.equal(result.llmAnnotation, null);
 });
 
 // 3. Contract shape holds under the FRED-enabled path too.
@@ -164,9 +166,10 @@ test("3/5. FRED enabled via synthetic fetchImpl: exactly two mock calls, no real
     );
     assert.equal(networkCalled, false);
     assert.equal(calls.length, 2); // proves the pipeline ran exactly once, not duplicated
-    assert.deepEqual(Object.keys(result).sort(), ["fredDiagnostics", "persistence", "pipelineResult"]);
+    assert.deepEqual(Object.keys(result).sort(), ["fredDiagnostics", "llmAnnotation", "persistence", "pipelineResult"]);
     assert.equal(result.pipelineResult.ok, true);
     assert.equal(result.pipelineResult.pipeline_summary.macro_status, "OK");
+    assert.equal(result.llmAnnotation, null);
     assert.ok(result.fredDiagnostics);
     assert.equal(result.fredDiagnostics.seriesResults[0].ok, true);
   });
