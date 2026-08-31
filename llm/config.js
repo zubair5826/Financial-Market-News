@@ -22,7 +22,7 @@ const ANTHROPIC_API_VERSION = "2023-06-01";
 // LLM_REASONING_LAYER_DESIGN.md §5 ("never 'latest' in production").
 const DEFAULT_MODEL = "claude-sonnet-5";
 const DEFAULT_TIMEOUT_MS = 15_000;
-const DEFAULT_MAX_TOKENS = 600;
+const DEFAULT_MAX_TOKENS = 2000;
 
 const ANTHROPIC_TRANSPORT_CONFIG = Object.freeze({
   apiBaseUrl: ANTHROPIC_API_BASE_URL,
