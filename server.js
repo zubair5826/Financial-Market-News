@@ -66,6 +66,7 @@ const http = require("http");
 const crypto = require("crypto");
 const { runApplicationRequest } = require("./app");
 const { runPortfolioIntelligenceRequest } = require("./portfolioIntelligence");
+const { runMarketIntelligenceRequest } = require("./providers/marketIntelligenceApplicationService");
 const { logEvent } = require("./logs/logger");
 
 const PORT = process.env.PORT || 3000;
@@ -381,10 +382,50 @@ async function handlePortfolioIntelligence(req, res) {
   return sendJson(res, 200, result);
 }
 
+// POST /api/market-intelligence — body: { request?: object, options?: object }.
+// Calls the existing, unmodified runMarketIntelligenceRequest() and
+// returns its existing { pipelineResult, diagnostics } shape verbatim.
+// Every provider domain (macro/market/news) is only ever touched if the
+// caller's own options.{macro,market,news}.enabled === true — identical
+// disabled-by-default rule as /api/intelligence's options.macro.enabled.
+// This endpoint has no persistence and no LLM annotation — it reuses
+// runMarketIntelligenceRequest() exactly as runLive.js already does,
+// and that function does neither of those things today.
+async function handleMarketIntelligence(req, res) {
+  if (req.method !== "POST") {
+    return sendJson(res, 405, { error: "Method Not Allowed", allowed: ["POST"] });
+  }
+  if (!isAuthorized(req)) {
+    return sendJson(res, 401, { error: "Unauthorized" });
+  }
+
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch (err) {
+    return sendJson(res, err.status || 400, { error: err.message || "Invalid request." });
+  }
+
+  if (body !== undefined && !isPlainObject(body)) {
+    return sendJson(res, 400, { error: "Request body must be a JSON object." });
+  }
+
+  const requestArg = (body && body.request) || {};
+  const optionsArg = (body && body.options) || {};
+
+  if (!isPlainObject(requestArg) || !isPlainObject(optionsArg)) {
+    return sendJson(res, 400, { error: "\"request\" and \"options\", if present, must be JSON objects." });
+  }
+
+  const result = await runMarketIntelligenceRequest(requestArg, optionsArg);
+  return sendJson(res, 200, result);
+}
+
 const ROUTES = {
   "/health": handleHealth,
   "/api/intelligence": handleIntelligence,
   "/api/portfolio-intelligence": handlePortfolioIntelligence,
+  "/api/market-intelligence": handleMarketIntelligence,
 };
 
 // One request-level log entry per HTTP request, regardless of which
