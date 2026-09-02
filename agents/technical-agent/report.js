@@ -14,6 +14,7 @@
 
 const { UNKNOWN } = require("../../core/constants");
 const { CONFIDENCE_LEVELS } = require("../../core/confidence");
+const { dedupeExact } = require("../../core/dedupe");
 
 function pickPrimaryAnalysis(analyses, options) {
   if (analyses.length === 0) return null;
@@ -93,8 +94,13 @@ function buildTechnicalReport(result, options = {}) {
     // BUY/SELL/LONG/SHORT — see README.md.
     technical_bias: deriveTechnicalBias(analyses),
     confidence,
-    uncertainties,
-    warnings: result.warnings,
+    // Deduplicated here only — the report's own presentation layer.
+    // result.warnings (used for confidence above, logging, and every
+    // other decision) is read from its original, un-deduplicated form;
+    // only the copy exposed on this report is collapsed, and only
+    // exact-duplicate entries are ever removed — see core/dedupe.js.
+    uncertainties: dedupeExact(uncertainties),
+    warnings: dedupeExact(result.warnings),
     sources,
   };
 }

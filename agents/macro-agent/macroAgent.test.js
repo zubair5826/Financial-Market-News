@@ -229,3 +229,95 @@ test("a non-array top-level input is rejected as FAILED", () => {
   const result = processMacroData("not-an-array");
   assert.equal(result.agent_status, MACRO_AGENT_STATUS.FAILED);
 });
+
+// --- Deduplication of identical report warnings/uncertainties ---
+// (root cause: every FRED-style observation independently contributes
+// its own copy of a freshness/verification/STALE message that carries
+// no per-record detail — see agents/macro-agent/report.js/core/dedupe.js)
+
+// Distinct `period` per record throughout, so records that would
+// otherwise be indicator/country-identical are never grouped together
+// by conflicts.js's own indicator_code::country::period key — conflict
+// detection is not what these tests are about.
+function missingTimestampRecord(overrides = {}) {
+  const record = baseRecord(overrides);
+  delete record.release_timestamp;
+  return record;
+}
+
+function staleRecordFor(overrides = {}) {
+  const oldTimestamp = new Date(Date.now() - 10_000_000).toISOString();
+  return baseRecord({ release_timestamp: oldTimestamp, ...overrides });
+}
+
+test("25a. identical freshness-UNKNOWN uncertainties from multiple records with the same indicator/country/source are emitted only once", () => {
+  const records = [
+    missingTimestampRecord({ period: "2026-01" }),
+    missingTimestampRecord({ period: "2026-02" }),
+    missingTimestampRecord({ period: "2026-03" }),
+  ];
+  const { result, report } = runMacroAgent(records, { freshnessThresholds: THRESHOLDS });
+  assert.equal(result.validated_records.length, 3); // underlying records unchanged
+  const matching = report.uncertainties.filter((u) => u.includes("freshness UNKNOWN"));
+  assert.equal(matching.length, 1);
+});
+
+test("25b. a genuinely different uncertainty (different indicator) is preserved alongside the deduplicated one", () => {
+  const records = [
+    missingTimestampRecord({ period: "2026-01" }),
+    missingTimestampRecord({ period: "2026-02" }),
+    missingTimestampRecord({ period: "2026-03", indicator: "Producer Price Index (PPI)", indicator_code: "PPI" }),
+  ];
+  const { report } = runMacroAgent(records, { freshnessThresholds: THRESHOLDS });
+  const cpiMatches = report.uncertainties.filter((u) => u.includes("Consumer Price Index (CPI)") && u.includes("freshness UNKNOWN"));
+  const ppiMatches = report.uncertainties.filter((u) => u.includes("Producer Price Index (PPI)") && u.includes("freshness UNKNOWN"));
+  assert.equal(cpiMatches.length, 1);
+  assert.equal(ppiMatches.length, 1);
+});
+
+test("25c. first-occurrence order is preserved after deduplication", () => {
+  const records = [
+    missingTimestampRecord({ period: "2026-01", indicator: "Alpha Indicator", indicator_code: "ALPHA" }),
+    missingTimestampRecord({ period: "2026-02", indicator: "Beta Indicator", indicator_code: "BETA" }),
+    missingTimestampRecord({ period: "2026-03", indicator: "Alpha Indicator", indicator_code: "ALPHA" }), // duplicate of the first
+  ];
+  const { report } = runMacroAgent(records, { freshnessThresholds: THRESHOLDS });
+  const freshnessUncertainties = report.uncertainties.filter((u) => u.includes("freshness UNKNOWN"));
+  assert.equal(freshnessUncertainties.length, 2);
+  assert.ok(freshnessUncertainties[0].includes("Alpha Indicator"));
+  assert.ok(freshnessUncertainties[1].includes("Beta Indicator"));
+});
+
+test("25d. identical object-shaped STALE_DATA warnings (failSafe results) from multiple stale records are deduplicated on the report, but not on the raw result", () => {
+  const records = [
+    staleRecordFor({ period: "2026-01" }),
+    staleRecordFor({ period: "2026-02" }),
+    staleRecordFor({ period: "2026-03" }),
+  ];
+  const { result, report } = runMacroAgent(records, { freshnessThresholds: THRESHOLDS });
+  assert.equal(result.validated_records.length, 3); // underlying records unchanged
+
+  const reportStaleWarnings = report.warnings.filter((w) => typeof w === "object" && w.code === "STALE_DATA");
+  assert.equal(reportStaleWarnings.length, 1);
+
+  // The raw result (what confidence, logging, and every other decision
+  // actually reads) is untouched — every occurrence is still present.
+  const rawStaleWarnings = result.warnings.filter((w) => typeof w === "object" && w.code === "STALE_DATA");
+  assert.equal(rawStaleWarnings.length, 3);
+});
+
+test("25e. deduplication does not change agent_status, confidence, or any validated record", () => {
+  const records = [
+    missingTimestampRecord({ period: "2026-01" }),
+    missingTimestampRecord({ period: "2026-02" }),
+    missingTimestampRecord({ period: "2026-03" }),
+  ];
+  const { result, report } = runMacroAgent(records, { freshnessThresholds: THRESHOLDS });
+  assert.equal(result.agent_status, MACRO_AGENT_STATUS.SUCCESS);
+  assert.equal(report.confidence, "MEDIUM"); // driven by result.warnings.length > 0 (un-deduped) — unaffected by dedup
+  assert.equal(result.validated_records.length, 3);
+  assert.deepEqual(
+    result.validated_records.map((r) => r.period),
+    ["2026-01", "2026-02", "2026-03"]
+  );
+});

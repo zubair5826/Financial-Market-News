@@ -306,3 +306,66 @@ test("a non-array top-level input is rejected as FAILED", () => {
   const result = processTechnicalData("not-an-array");
   assert.equal(result.agent_status, TECHNICAL_AGENT_STATUS.FAILED);
 });
+
+// --- Deduplication of identical report warnings ---
+// (root cause: a compact multi-day candle fetch includes many
+// genuinely old historical candles; each one independently produces
+// its own copy of an identical STALE_DATA warning that carries no
+// per-candle detail — see agents/technical-agent/report.js/core/dedupe.js)
+
+function staleCandle(overrides = {}) {
+  const oldTimestamp = new Date(Date.now() - 100_000_000).toISOString(); // ~27.8h, beyond the 24h test threshold
+  return baseCandle({ timestamp: oldTimestamp, ...overrides });
+}
+
+test("31a. identical STALE_DATA warnings from multiple stale candles (same asset/timeframe/source) are emitted only once on the report", () => {
+  const candles = [staleCandle(), staleCandle(), staleCandle()];
+  const { result, report } = runTechnicalAgent(candles, { freshnessThresholds: THRESHOLDS });
+  assert.equal(result.validated_candles.length, 3); // underlying candles unchanged
+
+  const reportStaleWarnings = report.warnings.filter((w) => typeof w === "object" && w.code === "STALE_DATA");
+  assert.equal(reportStaleWarnings.length, 1);
+});
+
+test("31b. a genuinely different STALE_DATA warning (different timeframe) is preserved alongside the deduplicated one", () => {
+  const candles = [staleCandle(), staleCandle(), staleCandle({ timeframe: "4h" })];
+  const { report } = runTechnicalAgent(candles, { freshnessThresholds: THRESHOLDS });
+  const oneHourWarnings = report.warnings.filter((w) => typeof w === "object" && w.code === "STALE_DATA" && w.message.includes("(1h)"));
+  const fourHourWarnings = report.warnings.filter((w) => typeof w === "object" && w.code === "STALE_DATA" && w.message.includes("(4h)"));
+  assert.equal(oneHourWarnings.length, 1);
+  assert.equal(fourHourWarnings.length, 1);
+});
+
+test("31c. first-occurrence order is preserved after deduplication", () => {
+  const candles = [
+    staleCandle({ asset: "BTC" }),
+    staleCandle({ asset: "ETH" }),
+    staleCandle({ asset: "BTC" }), // duplicate of the first
+  ];
+  const { report } = runTechnicalAgent(candles, { freshnessThresholds: THRESHOLDS });
+  const staleWarnings = report.warnings.filter((w) => typeof w === "object" && w.code === "STALE_DATA");
+  assert.equal(staleWarnings.length, 2);
+  assert.ok(staleWarnings[0].message.startsWith("BTC"));
+  assert.ok(staleWarnings[1].message.startsWith("ETH"));
+});
+
+test("31d. the raw result's warnings are unaffected — every occurrence is still present there, only the report's copy is deduplicated", () => {
+  const candles = [staleCandle(), staleCandle(), staleCandle()];
+  const { result, report } = runTechnicalAgent(candles, { freshnessThresholds: THRESHOLDS });
+  const rawStaleWarnings = result.warnings.filter((w) => typeof w === "object" && w.code === "STALE_DATA");
+  assert.equal(rawStaleWarnings.length, 3);
+  const reportStaleWarnings = report.warnings.filter((w) => typeof w === "object" && w.code === "STALE_DATA");
+  assert.equal(reportStaleWarnings.length, 1);
+});
+
+test("31e. deduplication does not change agent_status, confidence, or any validated candle", () => {
+  const candles = [staleCandle(), staleCandle(), staleCandle()];
+  const { result, report } = runTechnicalAgent(candles, { freshnessThresholds: THRESHOLDS });
+  assert.equal(result.agent_status, TECHNICAL_AGENT_STATUS.SUCCESS);
+  assert.equal(report.confidence, "MEDIUM"); // driven by result.warnings.length > 0 (un-deduped) — unaffected by dedup
+  assert.equal(result.validated_candles.length, 3);
+  assert.deepEqual(
+    result.validated_candles.map((c) => c.freshness_status),
+    ["STALE", "STALE", "STALE"]
+  );
+});

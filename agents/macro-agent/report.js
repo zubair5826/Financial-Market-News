@@ -13,6 +13,7 @@ const { SOURCE_VERIFICATION_STATES } = require("../../core/verification");
 const { FRESHNESS_STATES } = require("../../core/freshness");
 const { SURPRISE_STATES } = require("./surprise");
 const { summarizeMarketImpact, deriveMacroBias } = require("./impact");
+const { dedupeExact } = require("../../core/dedupe");
 
 function buildMacroReport(result, options = {}) {
   const records = result.validated_records;
@@ -81,9 +82,15 @@ function buildMacroReport(result, options = {}) {
     // here never means BUY; see README.md.
     macro_bias: macroBias,
     confidence,
-    uncertainties,
+    // Deduplicated here only — the report's own presentation layer.
+    // result.uncertainties/result.warnings (used for confidence above,
+    // logging, and every other decision) are read from their original,
+    // un-deduplicated form; only the copy exposed on this report is
+    // collapsed, and only exact-duplicate entries are ever removed —
+    // see core/dedupe.js.
+    uncertainties: dedupeExact(uncertainties),
     conflicts: result.conflicts,
-    warnings: result.warnings,
+    warnings: dedupeExact(result.warnings),
     sources,
   };
 }
