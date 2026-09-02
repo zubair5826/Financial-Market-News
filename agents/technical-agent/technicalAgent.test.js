@@ -5,6 +5,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const technicalAgent = require("./index");
 const { processTechnicalData, runTechnicalAgent, TECHNICAL_AGENT_STATUS } = technicalAgent;
+const { ERROR_CODES } = require("../../core/errors");
 
 const THRESHOLDS = { freshMaxMs: 3_600_000, agingMaxMs: 86_400_000 }; // 1h fresh, 24h aging — test-only
 
@@ -336,12 +337,20 @@ test("31b. a genuinely different STALE_DATA warning (different timeframe) is pre
   assert.equal(fourHourWarnings.length, 1);
 });
 
-test("31c. first-occurrence order is preserved after deduplication", () => {
-  const candles = [
-    staleCandle({ asset: "BTC" }),
-    staleCandle({ asset: "ETH" }),
-    staleCandle({ asset: "BTC" }), // duplicate of the first
-  ];
+// Updated for Step 2 (not weakened — the underlying property these
+// tests originally proved no longer exists to prove, by design): Step
+// 1's dedupeExact() collapsed multiple IDENTICAL-content warnings
+// after they were generated. Step 2 goes further for the technical
+// agent specifically — only the latest candle in each asset+timeframe
+// group is ever evaluated for a warning in the first place (see
+// identifyLatestCandlePerGroup() in index.js), so three same-group
+// stale candles no longer produce three raw duplicate warnings for
+// dedup to collapse; they never produce more than one to begin with.
+// core/dedupe.test.js and agents/macro-agent/macroAgent.test.js's own
+// 25a-25e (macro-agent is untouched by Step 2) still fully cover
+// dedupeExact()'s own exact-duplicate-collapsing behavior in isolation.
+test("31c. warnings for distinct asset+timeframe groups appear in the order each group's own latest candle is encountered", () => {
+  const candles = [staleCandle({ asset: "BTC" }), staleCandle({ asset: "ETH" })];
   const { report } = runTechnicalAgent(candles, { freshnessThresholds: THRESHOLDS });
   const staleWarnings = report.warnings.filter((w) => typeof w === "object" && w.code === "STALE_DATA");
   assert.equal(staleWarnings.length, 2);
@@ -349,12 +358,12 @@ test("31c. first-occurrence order is preserved after deduplication", () => {
   assert.ok(staleWarnings[1].message.startsWith("ETH"));
 });
 
-test("31d. the raw result's warnings are unaffected — every occurrence is still present there, only the report's copy is deduplicated", () => {
-  const candles = [staleCandle(), staleCandle(), staleCandle()];
+test("31d. Step 2 eliminates intra-group warning duplication at the source — result.warnings (raw) already has exactly one STALE_DATA entry per group, same as report.warnings", () => {
+  const candles = [staleCandle(), staleCandle(), staleCandle()]; // same asset+timeframe group
   const { result, report } = runTechnicalAgent(candles, { freshnessThresholds: THRESHOLDS });
   const rawStaleWarnings = result.warnings.filter((w) => typeof w === "object" && w.code === "STALE_DATA");
-  assert.equal(rawStaleWarnings.length, 3);
   const reportStaleWarnings = report.warnings.filter((w) => typeof w === "object" && w.code === "STALE_DATA");
+  assert.equal(rawStaleWarnings.length, 1);
   assert.equal(reportStaleWarnings.length, 1);
 });
 
@@ -368,4 +377,168 @@ test("31e. deduplication does not change agent_status, confidence, or any valida
     result.validated_candles.map((c) => c.freshness_status),
     ["STALE", "STALE", "STALE"]
   );
+});
+
+// --- Step 2: latest-candle-only freshness warnings/uncertainties ---
+// (root cause: a compact multi-day fetch legitimately includes many
+// genuinely old historical candles; only the single latest candle per
+// asset+timeframe group is decision-relevant for freshness — see
+// identifyLatestCandlePerGroup() in index.js)
+
+// `count` candles for one asset+timeframe group, oldest first, each
+// candle's `close` distinguishing it (100, 101, 102, ...) so a test
+// can identify exactly which one was flagged latest regardless of
+// input order. Index (count-1) is the newest (timestamp ~now).
+function timestampedCandles(count, overrides = {}) {
+  return Array.from({ length: count }, (_, i) => {
+    const close = 100 + i;
+    return baseCandle({
+      close,
+      open: close,
+      high: close + 1,
+      low: close - 1,
+      timestamp: new Date(Date.now() - (count - 1 - i) * 3_600_000).toISOString(),
+      ...overrides,
+    });
+  });
+}
+
+// `historicalCount` genuinely old (STALE, per THRESHOLDS' 24h aging
+// ceiling) candles, plus one final "latest" candle (close: 999,
+// timestamp "now" unless overridden) that is always the most recent
+// of the group by construction. open/high/low are kept consistent
+// with each candle's own `close` (never a fixed value) so a
+// distinguishing close never accidentally violates OHLC validation.
+function historicalPlusLatest(historicalCount, latestOverrides = {}) {
+  const historical = Array.from({ length: historicalCount }, (_, i) => {
+    const close = 100 + i;
+    return baseCandle({
+      close,
+      open: close,
+      high: close + 1,
+      low: close - 1,
+      timestamp: new Date(Date.now() - (historicalCount - i) * 100_000_000).toISOString(),
+    });
+  });
+  const latest = baseCandle({ close: 999, open: 999, high: 1000, low: 998, timestamp: new Date().toISOString(), ...latestOverrides });
+  return [...historical, latest];
+}
+
+// A. Historical candles remain available.
+test("A. many historical candles plus the latest all remain available to technical calculations", () => {
+  const candles = historicalPlusLatest(60); // 60 historical + 1 latest — enough for SMA-50
+  const { result, report } = runTechnicalAgent(candles, { freshnessThresholds: THRESHOLDS });
+  assert.equal(result.validated_candles.length, 61);
+  const analysis = report.timeframe_analysis.find((a) => a.timeframe === "1h");
+  assert.equal(analysis.candle_count, 61);
+  const sma50 = analysis.indicators.sma.find((s) => s.parameters.period === 50);
+  assert.equal(sma50.calculation_status, "CALCULATED"); // genuinely uses the historical candles, not just counts them
+});
+
+// B. Historical candles never independently create a STALE_DATA warning.
+test("B. many genuinely stale historical candles produce no STALE_DATA warning when the latest candle is fresh", () => {
+  const candles = historicalPlusLatest(20);
+  const { report } = runTechnicalAgent(candles, { freshnessThresholds: THRESHOLDS });
+  const staleWarnings = report.warnings.filter((w) => typeof w === "object" && w.code === "STALE_DATA");
+  assert.equal(staleWarnings.length, 0);
+});
+
+// C. Fresh latest candle: no warning, but still genuinely validated.
+test("C. a fresh latest candle produces no STALE warning and is confirmed freshness-validated, not silently skipped", () => {
+  const candles = historicalPlusLatest(20);
+  const { result } = runTechnicalAgent(candles, { freshnessThresholds: THRESHOLDS });
+  const latest = result.validated_candles.find((c) => c.close === 999);
+  assert.equal(latest.is_latest_in_group, true);
+  assert.equal(latest.freshness_status, "FRESH");
+});
+
+// D. Stale latest candle: exactly one warning.
+test("D. a genuinely stale latest candle produces exactly one STALE_DATA warning", () => {
+  // ~25h old — beyond the 24h aging threshold, but still more recent
+  // than every historical candle (the oldest of which is ~27.8h+ old).
+  const candles = historicalPlusLatest(20, { timestamp: new Date(Date.now() - 90_000_000).toISOString() });
+  const { report } = runTechnicalAgent(candles, { freshnessThresholds: THRESHOLDS });
+  const staleWarnings = report.warnings.filter((w) => typeof w === "object" && w.code === "STALE_DATA");
+  assert.equal(staleWarnings.length, 1);
+});
+
+// E. UNKNOWN latest timestamp — safe, never fabricated.
+test("E. a latest candle with a missing timestamp still safely yields UNKNOWN freshness, never a fabricated one", () => {
+  const candles = historicalPlusLatest(5);
+  delete candles[candles.length - 1].timestamp;
+  const { result } = runTechnicalAgent(candles, { freshnessThresholds: THRESHOLDS });
+  const latest = result.validated_candles.find((c) => c.close === 999);
+  assert.equal(latest.is_latest_in_group, true); // still identified as latest via the documented "trust input order" fallback
+  assert.equal(latest.freshness_status, "UNKNOWN");
+  assert.ok(!latest.timestamp || Number.isNaN(Date.parse(latest.timestamp))); // never a fabricated real date
+});
+
+// F. Ordering.
+test("F1. newest-first and oldest-first input orderings identify the same latest candle", () => {
+  const oldestFirst = timestampedCandles(5);
+  const newestFirst = [...oldestFirst].reverse();
+  const { result: r1 } = runTechnicalAgent(oldestFirst, { freshnessThresholds: THRESHOLDS });
+  const { result: r2 } = runTechnicalAgent(newestFirst, { freshnessThresholds: THRESHOLDS });
+  assert.equal(r1.validated_candles.find((c) => c.is_latest_in_group).close, 104);
+  assert.equal(r2.validated_candles.find((c) => c.is_latest_in_group).close, 104);
+});
+
+test("F2. a scrambled valid-timestamp ordering also identifies the same latest candle", () => {
+  const candles = timestampedCandles(5);
+  const scrambled = [candles[2], candles[0], candles[4], candles[1], candles[3]];
+  const { result } = runTechnicalAgent(scrambled, { freshnessThresholds: THRESHOLDS });
+  assert.equal(result.validated_candles.find((c) => c.is_latest_in_group).close, 104);
+});
+
+// G. Multiple asset+timeframe groups are fully independent.
+test("G. each asset+timeframe group gets its own independent latest-candle warning — one stale group never suppresses or replaces another's", () => {
+  const oldTimestamp = new Date(Date.now() - 200_000_000).toISOString();
+  const staleTimestamp = new Date(Date.now() - 90_000_000).toISOString(); // ~25h, beyond 24h aging
+  const freshTimestamp = new Date().toISOString();
+
+  const btcCandles = [
+    baseCandle({ asset: "BTC", timeframe: "1h", timestamp: oldTimestamp }),
+    baseCandle({ asset: "BTC", timeframe: "1h", timestamp: staleTimestamp }), // BTC's own latest — stale
+  ];
+  const ethCandles = [
+    baseCandle({ asset: "ETH", timeframe: "1h", timestamp: oldTimestamp }),
+    baseCandle({ asset: "ETH", timeframe: "1h", timestamp: freshTimestamp }), // ETH's own latest — fresh
+  ];
+
+  const { report } = runTechnicalAgent([...btcCandles, ...ethCandles], { freshnessThresholds: THRESHOLDS });
+  const staleWarnings = report.warnings.filter((w) => typeof w === "object" && w.code === "STALE_DATA");
+  assert.equal(staleWarnings.length, 1);
+  assert.ok(staleWarnings[0].message.startsWith("BTC"));
+});
+
+// H. Existing technical calculations remain unaffected.
+test("H. indicator calculations remain correct and unaffected even with many individually-stale historical candles present", () => {
+  const candles = historicalPlusLatest(60);
+  const { report } = runTechnicalAgent(candles, { freshnessThresholds: THRESHOLDS });
+  const analysis = report.timeframe_analysis.find((a) => a.timeframe === "1h");
+  const sma20 = analysis.indicators.sma.find((s) => s.parameters.period === 20);
+  assert.equal(sma20.calculation_status, "CALCULATED");
+  assert.equal(typeof sma20.current_value, "number");
+  assert.equal(analysis.candle_count, 61);
+});
+// (SMA/EMA/RSI/MACD/ATR/Bollinger/trend/momentum/pattern correctness
+// itself is already fully covered, unchanged, by tests 6-11/18-21
+// above — all still pass byte-for-byte against the same fixtures.)
+
+// I. Risk Manager interaction — proxied here via the exact same
+// mechanism agents/risk-manager/dataQuality.js's countStaleSignals()
+// uses (filtering warnings for entry.code === ERROR_CODES.STALE_DATA),
+// applied to the real report.warnings the Risk Manager actually
+// receives through trade-setup-agent's evidence extraction.
+test("I. the Risk Manager's stale-signal count no longer trips merely because historical candles exist, but still trips for a genuinely stale latest candle", () => {
+  const { report: freshReport } = runTechnicalAgent(historicalPlusLatest(30), { freshnessThresholds: THRESHOLDS });
+  const freshStaleSignalCount = freshReport.warnings.filter((w) => w && typeof w === "object" && w.code === ERROR_CODES.STALE_DATA).length;
+  assert.equal(freshStaleSignalCount, 0);
+
+  const { report: staleReport } = runTechnicalAgent(
+    historicalPlusLatest(30, { timestamp: new Date(Date.now() - 90_000_000).toISOString() }),
+    { freshnessThresholds: THRESHOLDS }
+  );
+  const staleStaleSignalCount = staleReport.warnings.filter((w) => w && typeof w === "object" && w.code === ERROR_CODES.STALE_DATA).length;
+  assert.equal(staleStaleSignalCount, 1);
 });

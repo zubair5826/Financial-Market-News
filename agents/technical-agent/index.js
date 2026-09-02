@@ -87,6 +87,38 @@ function sortCandlesChronologically(candles) {
   return [...candles].sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
 }
 
+// A compact multi-day fetch (e.g. Alpha Vantage's outputsize=compact)
+// legitimately includes many genuinely old candles alongside the
+// current one — historical context technical analysis actually needs
+// (see analyzeTimeframeGroup below). Only ONE candle per asset+
+// timeframe group is "the latest," and only its own freshness result
+// is decision-relevant; every other candle in the group being old is
+// expected, not a data-quality problem worth its own warning.
+//
+// Reuses sortCandlesChronologically() itself — never a second,
+// competing ordering implementation — so this inherits the exact same
+// ordering guarantee (a full re-sort when every candle in the group
+// has a valid timestamp) and the exact same documented fallback
+// (trust the group's own supplied order when at least one doesn't).
+//
+// Returns a Map keyed by "asset::timeframe" to that group's single
+// latest candle (by reference, so callers can compare with ===).
+function identifyLatestCandlePerGroup(candles) {
+  const groups = new Map();
+  for (const candle of candles) {
+    const key = `${candle.asset}::${candle.timeframe}`;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(candle);
+  }
+
+  const latestByGroup = new Map();
+  for (const [key, groupCandles] of groups) {
+    const sorted = sortCandlesChronologically(groupCandles);
+    latestByGroup.set(key, sorted[sorted.length - 1]);
+  }
+  return latestByGroup;
+}
+
 function analyzeTimeframeGroup(timeframe, rawGroupCandles, options) {
   const candles = sortCandlesChronologically(rawGroupCandles);
   const lastCandle = candles[candles.length - 1];
@@ -223,6 +255,11 @@ function processTechnicalData(input, options = {}) {
   const validated = [];
   const rejected = [];
 
+  // Pass 1: normalize + structurally validate every raw candle exactly
+  // as before. Freshness is deliberately NOT computed yet here — it
+  // needs every candle in a group already collected (pass 2 below)
+  // before "which one is latest" can be determined.
+  const normalizedCandidates = [];
   for (const raw of input) {
     const candle = normalizeCandle(raw, options.fieldMap || {});
 
@@ -242,22 +279,49 @@ function processTechnicalData(input, options = {}) {
       continue;
     }
 
-    // Freshness is computed here from timestamp, never trusted from
-    // the caller's own "real-time" claim.
+    normalizedCandidates.push(candle);
+  }
+
+  for (const r of rejected) errors.push(r.reason);
+
+  // Pass 2: exactly one "latest" candle per asset+timeframe group —
+  // see identifyLatestCandlePerGroup's own comment for why grouping
+  // happens here rather than deferring to the per-timeframe analysis
+  // grouping further below (that grouping is also asset-filtered by
+  // options.requestedAsset first; freshness must be evaluated for
+  // every supplied asset's own latest candle, not only the requested
+  // one — unchanged from the pre-existing behavior of evaluating every
+  // validated candle, just narrowed to one per group instead of all).
+  const latestCandleByGroup = identifyLatestCandlePerGroup(normalizedCandidates);
+
+  // Pass 3: freshness is computed here from timestamp, never trusted
+  // from the caller's own "real-time" claim — for EVERY candle,
+  // exactly as before (still needed by report.js's own per-candle
+  // checks and by anything downstream sampling individual candles).
+  // Only the WARNING/UNCERTAINTY a stale or unknown-freshness result
+  // would otherwise contribute is now narrowed to the group's single
+  // latest candle — a historical candle being old is expected, not a
+  // data-quality problem worth its own repeated signal.
+  for (const candle of normalizedCandidates) {
     const thresholds = resolveFreshnessThresholds(candle, options);
     candle.freshness_status = computeFreshness(candle.timestamp, thresholds);
 
-    if (candle.freshness_status === FRESHNESS_STATES.UNKNOWN) {
-      const reason =
-        !candle.timestamp || candle.timestamp === UNKNOWN ? "no timestamp was supplied" : "no freshness thresholds were configured";
-      warnings.push(`Freshness UNKNOWN for ${candle.asset} (${candle.timeframe}) from ${candle.source} — ${reason}.`);
-    } else if (candle.freshness_status === FRESHNESS_STATES.STALE) {
-      warnings.push(
-        failSafe(ERROR_CODES.STALE_DATA, `${candle.asset} (${candle.timeframe}) candle from ${candle.source} is STALE DATA.`, {
-          asset: candle.asset,
-          timeframe: candle.timeframe,
-        })
-      );
+    const groupKey = `${candle.asset}::${candle.timeframe}`;
+    candle.is_latest_in_group = latestCandleByGroup.get(groupKey) === candle;
+
+    if (candle.is_latest_in_group) {
+      if (candle.freshness_status === FRESHNESS_STATES.UNKNOWN) {
+        const reason =
+          !candle.timestamp || candle.timestamp === UNKNOWN ? "no timestamp was supplied" : "no freshness thresholds were configured";
+        warnings.push(`Freshness UNKNOWN for ${candle.asset} (${candle.timeframe}) from ${candle.source} — ${reason}.`);
+      } else if (candle.freshness_status === FRESHNESS_STATES.STALE) {
+        warnings.push(
+          failSafe(ERROR_CODES.STALE_DATA, `${candle.asset} (${candle.timeframe}) candle from ${candle.source} is STALE DATA.`, {
+            asset: candle.asset,
+            timeframe: candle.timeframe,
+          })
+        );
+      }
     }
 
     if (candle.verification_status === UNKNOWN) {
@@ -266,8 +330,6 @@ function processTechnicalData(input, options = {}) {
 
     validated.push(candle);
   }
-
-  for (const r of rejected) errors.push(r.reason);
 
   // Everything supplied is validated above regardless of asset; only
   // the requested asset's candles are grouped/analyzed below. This

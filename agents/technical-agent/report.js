@@ -50,7 +50,13 @@ function buildTechnicalReport(result, options = {}) {
 
   const uncertainties = [];
   for (const c of result.validated_candles) {
-    if (c.freshness_status === "UNKNOWN") {
+    // Only the latest candle in its asset+timeframe group (flagged by
+    // index.js's own identifyLatestCandlePerGroup(), the single source
+    // of truth for "which candle is current") ever contributes a
+    // freshness uncertainty here — a historical candle carrying
+    // UNKNOWN freshness is expected context data, not something worth
+    // its own repeated uncertainty.
+    if (c.is_latest_in_group && c.freshness_status === "UNKNOWN") {
       uncertainties.push(`${c.asset} (${c.timeframe}) candle from ${c.source}: freshness UNKNOWN.`);
     }
   }
