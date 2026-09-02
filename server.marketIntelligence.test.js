@@ -16,14 +16,30 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 
 const TEST_AUTH_TOKEN = "SYNTHETIC_TEST_AUTH_TOKEN_MARKET_INTEL";
 const AUTH_HEADERS = Object.freeze({ Authorization: `Bearer ${TEST_AUTH_TOKEN}` });
 const JSON_AUTH_HEADERS = Object.freeze({ "Content-Type": "application/json", Authorization: `Bearer ${TEST_AUTH_TOKEN}` });
 
+// This file's only two real POST /api/intelligence calls (tests 4b and
+// 8b) must never write to the real data/runs.jsonl — mirrors
+// server.test.js's own TEST_RUNS_FILE/RUN_STORE_OPTIONS pattern
+// exactly. /api/market-intelligence itself has no persistence at all
+// (runMarketIntelligenceRequest() never calls persistRun()), so this
+// override is only ever needed on the /api/intelligence calls.
+const TEST_RUNS_FILE = path.join(os.tmpdir(), `server-market-intel-test-runs-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`);
+const RUN_STORE_OPTIONS = { runStore: { filePath: TEST_RUNS_FILE } };
+
 process.env.API_AUTH_TOKEN = TEST_AUTH_TOKEN;
 test.after(() => {
   delete process.env.API_AUTH_TOKEN;
+  try {
+    fs.unlinkSync(TEST_RUNS_FILE);
+  } catch {
+    // Already absent.
+  }
 });
 
 // Mirrors server.test.js's own helper exactly — each test file owns
@@ -166,7 +182,7 @@ test("4b. a request to /api/intelligence and one to /api/market-intelligence sha
       const second = await fetch(`${baseUrl}/api/intelligence`, {
         method: "POST",
         headers: JSON_AUTH_HEADERS,
-        body: JSON.stringify({ request: { query: "Assess BTC", asset: "BTC" } }),
+        body: JSON.stringify({ request: { query: "Assess BTC", asset: "BTC" }, options: RUN_STORE_OPTIONS }),
       });
       const third = await fetch(`${baseUrl}/api/market-intelligence`, {
         method: "POST",
@@ -326,7 +342,7 @@ test("8b. /api/intelligence is unaffected by this change — same auth rule, sam
     const authorized = await fetch(`${baseUrl}/api/intelligence`, {
       method: "POST",
       headers: JSON_AUTH_HEADERS,
-      body: JSON.stringify({ request: { query: "Assess BTC", asset: "BTC" } }),
+      body: JSON.stringify({ request: { query: "Assess BTC", asset: "BTC" }, options: RUN_STORE_OPTIONS }),
     });
     assert.equal(authorized.status, 200);
     const body = await authorized.json();
