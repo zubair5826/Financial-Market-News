@@ -178,3 +178,74 @@ test("a non-array top-level input is rejected as FAILED", () => {
   const result = processNews("not-an-array");
   assert.equal(result.agent_status, NEWS_AGENT_STATUS.FAILED);
 });
+
+// --- Step 3A: LOW_RELEVANCE items never participate in conflict detection ---
+
+// A. A LOW_RELEVANCE article that would otherwise create a false
+// conflict (it shares a tagged asset + category with a genuinely
+// relevant article, purely coincidentally) no longer does.
+test("A. a LOW_RELEVANCE article that would otherwise create a false conflict does not appear in conflicting_reports", () => {
+  const direct = baseItem({
+    headline: "Fed signals rate policy shift",
+    source: "source-A",
+    category: "monetary-policy",
+    related_assets: ["USD", "SPYUSDT"],
+    impact_direction: "POSITIVE",
+  });
+  const lowRelevance = baseItem({
+    headline: "Crypto pair SPYUSDT sees volatility",
+    source: "source-B",
+    category: "monetary-policy",
+    related_assets: ["SPYUSDT"], // shares "SPYUSDT" + category with `direct`, but never the requested asset
+    impact_direction: "NEGATIVE",
+  });
+  const result = processNews([direct, lowRelevance], { freshnessThresholds: THRESHOLDS, requestedAsset: "USD" });
+  assert.equal(result.validated_items.find((i) => i.headline === lowRelevance.headline).relevance, "LOW_RELEVANCE");
+  assert.equal(result.conflicts.length, 0);
+  assert.equal(result.agent_status, NEWS_AGENT_STATUS.SUCCESS); // never CONFLICTING
+});
+
+// B. A genuine conflict between two relevant (DIRECT) articles is
+// still detected — the narrowing must never hide a real conflict.
+test("B. a genuine conflict between two DIRECT-relevance articles about the requested asset is still detected", () => {
+  const a = baseItem({
+    headline: "Company announces positive earnings",
+    source: "source-A",
+    category: "earnings",
+    related_assets: ["ACME"],
+    impact_direction: "POSITIVE",
+  });
+  const b = baseItem({
+    headline: "Company reportedly missed expectations",
+    source: "source-B",
+    category: "earnings",
+    related_assets: ["ACME"],
+    impact_direction: "NEGATIVE",
+  });
+  const result = processNews([a, b], { freshnessThresholds: THRESHOLDS, requestedAsset: "ACME" });
+  assert.equal(result.validated_items[0].relevance, "DIRECT");
+  assert.equal(result.validated_items[1].relevance, "DIRECT");
+  assert.equal(result.conflicts.length, 1);
+  assert.equal(result.agent_status, NEWS_AGENT_STATUS.CONFLICTING);
+});
+
+// C. LOW_RELEVANCE articles are never dropped from the underlying data
+// — only excluded from conflict-detection participation.
+test("C. LOW_RELEVANCE articles remain present in validated_items and the report's news_items, never dropped", () => {
+  const direct = baseItem({ related_assets: ["USD"], impact_direction: "POSITIVE" });
+  const lowRelevance = baseItem({ headline: "Unrelated sports story", category: "sports", related_assets: ["EUR"] });
+  const { result, report } = runNewsAgent([direct, lowRelevance], { freshnessThresholds: THRESHOLDS, requestedAsset: "USD" });
+  assert.equal(result.validated_items.length, 2);
+  assert.equal(report.news_items.length, 2);
+  assert.ok(report.news_items.some((i) => i.relevance === "LOW_RELEVANCE"));
+});
+
+// D. Existing behavior for an ordinary, single relevant item is
+// completely unchanged by this narrowing.
+test("D. existing behavior for a single relevant (DIRECT) item is completely unchanged", () => {
+  const result = processNews([baseItem()], { freshnessThresholds: THRESHOLDS, requestedAsset: "USD" });
+  assert.equal(result.agent_status, NEWS_AGENT_STATUS.SUCCESS);
+  assert.equal(result.validated_items.length, 1);
+  assert.equal(result.validated_items[0].relevance, "DIRECT");
+  assert.equal(result.conflicts.length, 0);
+});

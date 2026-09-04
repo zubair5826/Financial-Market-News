@@ -21,7 +21,7 @@ const { normalizeNewsItem } = require("./normalize");
 const { validateNewsInput } = require("./validate");
 const { detectDuplicates } = require("./duplicates");
 const { detectConflictingReports } = require("./conflicts");
-const { assessRelevance } = require("./relevance");
+const { assessRelevance, RELEVANCE_LEVELS } = require("./relevance");
 const { assessImportance } = require("./importance");
 const { buildNewsSummary } = require("./report");
 
@@ -173,8 +173,31 @@ function processNews(input, options = {}) {
 
   for (const r of rejected) errors.push(r.reason);
 
-  const duplicates = detectDuplicates(validated);
-  const conflicts = detectConflictingReports(validated, duplicates);
+  // Step 3A: an item with no meaningful connection to the requested
+  // asset (LOW_RELEVANCE) must never participate in duplicate/conflict
+  // detection — two items that only coincidentally share a tagged
+  // asset/category (e.g. a genuine SPY-ETF story vs. an unrelated
+  // SPY-adjacent crypto/forex-style listing) can otherwise be grouped
+  // as "likely the same event" and flagged as a false CONFLICTING_DATA
+  // signal, even though they aren't really about the same thing.
+  //
+  // Relevance is computed here ONLY to build this narrowed candidate
+  // list — assessRelevance() is pure and deterministic (reads only
+  // related_assets/related_markets/category), so calling it again in
+  // the existing assignment loop below produces byte-identical
+  // results; it is not reordered relative to conflict detection, so
+  // that loop's existing dependency (verification_status is set to
+  // CONFLICTING by detectConflictingReports() BEFORE importance reads
+  // it) is completely unchanged. validated/rejected are never touched
+  // by this narrowing — every item, including every LOW_RELEVANCE one,
+  // still flows into validated_items/news_items exactly as before.
+  const conflictDetectionCandidates = validated.filter(
+    (item) =>
+      assessRelevance(item, options.requestedAsset, { sectorCategories: options.sectorCategories }) !== RELEVANCE_LEVELS.LOW_RELEVANCE
+  );
+
+  const duplicates = detectDuplicates(conflictDetectionCandidates);
+  const conflicts = detectConflictingReports(conflictDetectionCandidates, duplicates);
   for (const c of conflicts) {
     warnings.push(
       failSafe(ERROR_CODES.CONFLICTING_DATA, `Conflicting reports detected among likely-same-event items — CONFLICTING DATA.`, c)
