@@ -53,6 +53,12 @@ Two honest limits worth knowing:
   Each extra timeframe is one more Alpha Vantage request, and the free tier's
   daily quota is small — that's why the default stays at one.
 
+None of the above needs `ANTHROPIC_API_KEY`. The deterministic
+pipeline never calls Claude and runs the same way with or without it.
+That key only matters if you explicitly opt into the isolated,
+additive reasoning layer under `llm/` (`options.llm.enabled === true`)
+— see README.md's Known Limitations section.
+
 ## 4. Run the HTTP API
 
 ```bash
@@ -66,6 +72,19 @@ curl -s -X POST localhost:3000/api/intelligence \
   -H "Authorization: Bearer pick-a-long-random-secret" \
   -H "Content-Type: application/json" \
   -d '{"request":{"query":"Assess SPY","asset":"SPY"}}'
+
+curl -s -X POST localhost:3000/api/portfolio-intelligence \
+  -H "Authorization: Bearer pick-a-long-random-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"I have $10,000 for 5 years. I am comfortable with moderate risk."}'
+
+# Same request shape as /api/intelligence, routed through the live
+# multi-provider composition runLive.js also uses. Each domain below is
+# only touched when its own options.<domain>.enabled is true.
+curl -s -X POST localhost:3000/api/market-intelligence \
+  -H "Authorization: Bearer pick-a-long-random-secret" \
+  -H "Content-Type: application/json" \
+  -d '{"request":{"query":"Assess SPY","asset":"SPY"},"options":{"macro":{"enabled":true}}}'
 ```
 
 Things to know before exposing it:

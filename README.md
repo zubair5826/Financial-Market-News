@@ -364,13 +364,28 @@ credentials exist in this repo in any environment.**
 
 ## HTTP API (`server.js`)
 
-`npm start`. Three routes, no framework, no dependencies:
+`npm start`. Four routes, no framework, no dependencies:
 
 | Route | Auth | Rate limited | Body |
 |---|---|---|---|
 | `GET /health` | none | no | — |
 | `POST /api/intelligence` | `Authorization: Bearer $API_AUTH_TOKEN` | yes | `{ request, options }` |
 | `POST /api/portfolio-intelligence` | same | yes | the request object itself |
+| `POST /api/market-intelligence` | same | yes | `{ request, options }` |
+
+`POST /api/market-intelligence` uses the same
+`Authorization: Bearer $API_AUTH_TOKEN` check as the other protected
+routes and calls the existing, unmodified
+`runMarketIntelligenceRequest()`
+([providers/marketIntelligenceApplicationService.js](providers/marketIntelligenceApplicationService.js))
+— the same live-data composition `runLive.js` already exercises from
+the command line, now reachable over HTTP. Each provider domain
+(`macro`/`market`/`news`) is only touched when the caller's own
+`options.<domain>.enabled === true`, identical to
+`/api/intelligence`'s `options.macro.enabled` rule. It returns that
+function's existing `{ pipelineResult, diagnostics }` shape verbatim —
+no new response contract, no persistence, and no LLM annotation (this
+entrypoint has neither).
 
 Security properties, each covered by tests in
 [server.test.js](server.test.js): the bearer comparison is
@@ -499,11 +514,35 @@ see [Fail-Safe Guarantees](#fail-safe-guarantees)).
   repository stores what actually happened afterwards, so system
   accuracy still cannot be measured from these records alone. That is
   the single biggest remaining gap in this project.
-- **No agent system prompts committed.** `prompts/` is an empty
-  placeholder — this codebase is deterministic logic, not an LLM
-  agent. A full design for a future LLM layer exists in
-  [LLM_REASONING_LAYER_DESIGN.md](LLM_REASONING_LAYER_DESIGN.md); no
-  part of it is implemented.
+- **The deterministic pipeline remains the sole decision authority.**
+  Every field this system's docs describe elsewhere as a decision —
+  `risk_decision`, `decision_status`, `final_assessment` — is produced
+  entirely by the deterministic agents/orchestrator described
+  throughout this document, exactly as before. `prompts/` is an empty
+  placeholder — no agent in the deterministic pipeline is, or has ever
+  been, driven by an LLM.
+- **An isolated, opt-in Claude/Anthropic reasoning layer exists under
+  [`llm/`](llm/)**, per the design in
+  [LLM_REASONING_LAYER_DESIGN.md](LLM_REASONING_LAYER_DESIGN.md). It
+  runs only when a caller explicitly sets `options.llm.enabled ===
+  true` (see [app.js](app.js)); the deterministic system requires no
+  Anthropic credential and behaves identically whether the layer is
+  used or not. When enabled, it reads the already-finalized pipeline
+  result read-only, through a deep-frozen Evidence Package
+  ([llm/evidencePackage.js](llm/evidencePackage.js)), and returns its
+  output as a separate, additive `llmAnnotation` field — it never
+  replaces, overrides, or feeds back into `risk_decision`,
+  `decision_status`, or `final_assessment`. A validation/hallucination
+  guard ([llm/validateOutput.js](llm/validateOutput.js)) rejects any
+  Claude output that would attempt to override the Risk Manager's
+  decision. Any failure of this layer (network, timeout, auth, rate
+  limit, malformed response, schema, or a risk-override attempt) is
+  reported only through `llmAnnotation`; the deterministic
+  `pipelineResult` is unaffected either way. `ANTHROPIC_API_KEY`
+  ([.env.example](.env.example), read only in
+  [llm/anthropicLiveSource.js](llm/anthropicLiveSource.js)) is
+  required only when this optional path is enabled — it is never read
+  by, and never needed for, ordinary deterministic operation.
 - **Freshness thresholds are centralized but not calibrated.**
   [config/freshness.js](config/freshness.js) defines a reasoned window
   per domain (market / news / macro) and orchestrator/index.js applies
