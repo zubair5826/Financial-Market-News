@@ -40,12 +40,24 @@ function buildMessages(evidencePackage) {
   return [{ role: "user", content: JSON.stringify(evidencePackage) }];
 }
 
+// Strips a single optional markdown code fence (```json ... ``` or
+// ``` ... ```) and surrounding whitespace. Anthropic completions
+// commonly wrap JSON in a fence even when told to respond with nothing
+// else; this only widens what counts as "the model's JSON" before the
+// unchanged, strict JSON.parse below — it never coerces or guesses at
+// malformed/partial content.
+function stripMarkdownCodeFence(text) {
+  const trimmed = text.trim();
+  const fenceMatch = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  return fenceMatch ? fenceMatch[1] : trimmed;
+}
+
 // A non-JSON (or partially-JSON) completion is a malformed response,
 // never coerced or guessed into a shape.
 function parseCandidateOutput(text) {
   if (typeof text !== "string") return { ok: false };
   try {
-    return { ok: true, value: JSON.parse(text) };
+    return { ok: true, value: JSON.parse(stripMarkdownCodeFence(text)) };
   } catch {
     return { ok: false };
   }

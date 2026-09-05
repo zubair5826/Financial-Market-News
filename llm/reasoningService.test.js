@@ -234,6 +234,33 @@ test("a completion whose text is not valid JSON maps to status INVALID_OUTPUT", 
   });
 });
 
+// Step 12 regression: a real Anthropic completion commonly wraps its
+// JSON in a markdown code fence, or pads it with whitespace, even when
+// told to respond with nothing else. parseCandidateOutput() must still
+// accept it.
+test("a completion wrapped in a markdown code fence, or padded with surrounding whitespace, is still accepted as valid JSON", async () => {
+  await withEnvKey(SYNTHETIC_KEY, async () => {
+    const fencedBody = anthropicSuccessBody(
+      {},
+      { content: [{ type: "text", text: "  \n```json\n" + JSON.stringify(validClaudeOutput()) + "\n```\n  " }] }
+    );
+    const fencedResult = await runReasoningService(syntheticPipelineResult(), request, {
+      llmConfig: { fetchImpl: async () => jsonResponse(200, fencedBody) },
+    });
+    assert.equal(fencedResult.status, "VALID");
+    assert.equal(fencedResult.output.narrative_summary, validClaudeOutput().narrative_summary);
+
+    const whitespacePaddedBody = anthropicSuccessBody(
+      {},
+      { content: [{ type: "text", text: "\n\n  " + JSON.stringify(validClaudeOutput()) + "  \n" }] }
+    );
+    const whitespaceResult = await runReasoningService(syntheticPipelineResult(), request, {
+      llmConfig: { fetchImpl: async () => jsonResponse(200, whitespacePaddedBody) },
+    });
+    assert.equal(whitespaceResult.status, "VALID");
+  });
+});
+
 test("a completion whose JSON does not match the output schema maps to status INVALID_OUTPUT", async () => {
   await withEnvKey(SYNTHETIC_KEY, async () => {
     const result = await runReasoningService(syntheticPipelineResult(), request, {
