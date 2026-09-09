@@ -10,6 +10,8 @@
 
 const { loadLiveMacroData } = require("./fredMacroLiveSource");
 const { processRequest } = require("../orchestrator");
+const { runMarketIntelligenceRequest } = require("./marketIntelligenceApplicationService");
+
 const { failSafe, ERROR_CODES } = require("../core/errors");
 
 const DEFAULT_SERIES_IDS = ["GNPCA"];
@@ -23,6 +25,18 @@ const DEFAULT_SERIES_IDS = ["GNPCA"];
 //   loadLiveMacroData()'s own existing design.
 async function runFredAwareRequest(request, options = {}) {
   const macroOptions = (options && options.macro) || {};
+  if (options.market?.enabled === true || options.news?.enabled === true) {
+    const result = await runMarketIntelligenceRequest(request, {
+      ...options,
+      macroAdapterConfig: options.macroAdapterConfig || options.adapterConfig,
+      macroComposeOptions: options.macroComposeOptions || options.composeOptions,
+    });
+
+    return {
+      pipelineResult: result.pipelineResult,
+      fredDiagnostics: result.diagnostics ? result.diagnostics.macro : null,
+    };
+  }
 
   if (macroOptions.enabled !== true) {
     // FRED disabled (the default): no network access, no credential

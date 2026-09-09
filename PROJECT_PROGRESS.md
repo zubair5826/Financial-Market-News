@@ -6,10 +6,20 @@ production HTTP API wrapping both. Update this file whenever a
 material change lands — it is the authoritative source for "what's
 done" and "what's next," not a substitute for the code or tests.
 
-This project has **no LLM/Claude/Anthropic integration of any kind.**
-Every agent, provider adapter, and portfolio calculation below is
-deterministic hand-written logic — there is no prompt, no model call,
-and no AI-generated inference anywhere in the runtime path.
+**Every decision this system makes is deterministic.** Every agent,
+provider adapter, and portfolio calculation below is hand-written
+logic — no model call influences a risk decision, a decision status,
+or a final assessment, and none ever will.
+
+Since Step 5D there is also an **isolated, opt-in Claude/Anthropic
+reasoning layer** under `llm/` (see the section below and
+`LLM_REASONING_LAYER_DESIGN.md`). It is off unless a caller sets
+`options.llm.enabled === true`, it runs only *after* the deterministic
+pipeline has finished, and its output is attached as a separate,
+additive `llmAnnotation` field that can never replace or mutate the
+deterministic result. An earlier revision of this file stated that no
+LLM integration of any kind existed; that was accurate when written and
+is no longer true.
 
 ## 1. Completed
 
@@ -98,6 +108,13 @@ Express or other framework:
   the caller's own request body sets `options.macro.enabled === true`
 - `POST /api/portfolio-intelligence` → calls the existing, unmodified
   `runPortfolioIntelligenceRequest()`; never touches any provider
+- `POST /api/market-intelligence` → calls the existing, unmodified
+  `runMarketIntelligenceRequest()` (the live multi-source path
+  `runLive.js` uses) and returns its `{ pipelineResult, diagnostics }`
+  shape verbatim. Each provider domain is touched only when the
+  caller's own `options.{macro,market,news}.enabled === true` — the
+  same disabled-by-default rule as `/api/intelligence`. No persistence
+  and no LLM annotation on this route.
 - Request-body size limit, malformed/invalid-JSON handling, generic
   500s with no leaked stack traces or internals, 404 for unknown
   routes, 405 for unsupported methods, graceful `SIGTERM`/`SIGINT`
@@ -114,13 +131,52 @@ Express or other framework:
   container/cloud deploys must set `HOST=0.0.0.0`.
 - Start command: **`npm start`** (runs `node server.js`).
 
+### Claude/Anthropic reasoning layer (isolated, opt-in, additive)
+Implemented under `llm/` per `LLM_REASONING_LAYER_DESIGN.md`, wired in
+at exactly one point (`app.js`) and nowhere else:
+
+- `llm/config.js` — transport configuration only (base URL, API
+  version, pinned model `claude-sonnet-5`, timeout, max tokens). Holds
+  no secret.
+- `llm/anthropicLiveSource.js` — **the only file that reads
+  `ANTHROPIC_API_KEY`**, matching the one-file-per-credential rule
+  already enforced for FRED and Alpha Vantage. The key travels only in
+  the `x-api-key` transport header.
+- `llm/anthropicAdapter.js` — HTTP transport and error mapping.
+- `llm/evidencePackage.js` — builds a deep-frozen Evidence Package
+  from the **completed** `pipelineResult`; this is the only thing the
+  model ever sees. No credential and no raw request object is included.
+- `llm/reasoningService.js` — composes Evidence Package → transport →
+  output validation into one call. Imports no agent, orchestrator,
+  provider, `server.js`, or `app.js`.
+- `llm/validateClaudeOutput.js` / `llm/validateOutput.js` /
+  `llm/hallucinationGuard.js` / `llm/assertNoRiskOverride.js` — reject
+  any model output that is malformed, cites evidence that isn't in the
+  package, invents a number, claims BUY/SELL authority, or attempts to
+  override the Risk Manager.
+
+Guarantees, each covered by a test in `app.llmIntegration.test.js`:
+disabled unless `options.llm.enabled === true` (and no network request
+is even built when disabled); the deterministic pipeline runs to
+completion first; `pipelineResult` is byte-for-byte unchanged whether
+the layer succeeds, fails, times out, or throws; any failure surfaces
+only as a non-`VALID` `llmAnnotation` with a fixed generic message; and
+the API key never appears in the Evidence Package, the response, or a
+log line.
+
+`app.js` returns `{ pipelineResult, fredDiagnostics, persistence,
+llmAnnotation }`, with `llmAnnotation` `null` whenever the layer did
+not run. `POST /api/intelligence` passes `options` straight through, so
+the layer is reachable over HTTP under the same opt-in rule.
+
 ### Tests
-**1156/1156 passing** as of the last full run (`npm test`, Node v22) —
-covers every core contract, all 8 agents, the orchestrator,
-both provider integrations (including mocked failure-mode coverage for
-`API_UNAVAILABLE`/`TIMEOUT`/`RATE_LIMIT`/`AUTH_FAILURE`), the complete
-Portfolio Intelligence stack, and the HTTP API layer. No test requires
-real credentials or makes a real network call.
+**1440/1440 passing** across 103 test files as of the last full run
+(`npm test`, Node v22) — covers every core contract, all 8 agents, the
+orchestrator, both provider integrations (including mocked failure-mode
+coverage for `API_UNAVAILABLE`/`TIMEOUT`/`RATE_LIMIT`/`AUTH_FAILURE`),
+the complete Portfolio Intelligence stack, the HTTP API layer, and the
+27 dedicated LLM-isolation tests in `app.llmIntegration.test.js`. No
+test requires real credentials or makes a real network call.
 
 ### Git / deployment status
 - 5 commits on `main`, most recent `a5622b6` ("Add production HTTP
@@ -179,13 +235,14 @@ full environment-variable table was added.
 
 A GitHub Actions workflow was authored (Node 18 + 22 matrix, plus a
 guard that fails the build if a test run wrote to the production
-`data/runs.jsonl`) but lives at `ci/github-actions-test.yml`, **not**
-`.github/workflows/test.yml` — this repository's write access could
-not create files under `.github/workflows/` directly. **CI is not yet
-running.** Activating it is one manual step (copy the file to
-`.github/workflows/test.yml`, commit, push) — see `ci/README.md` for
-the exact commands. Until that copy happens, no workflow runs on any
-push or pull request.
+`data/runs.jsonl`) at `ci/github-actions-test.yml`, which at the time
+could not be written directly under `.github/workflows/`.
+
+**This has since been done.** `.github/workflows/test.yml` now exists
+and is byte-for-byte identical to `ci/github-actions-test.yml`, so the
+suite runs on every push and pull request. The `data/runs.jsonl` guard
+was re-verified locally: a full `npm test` from a clean tree leaves no
+`data/runs.jsonl` behind.
 
 ### Steps 112–113 — HOW_TO_RUN.md formally accepted as authoritative
 
@@ -205,6 +262,149 @@ forward. It is no longer treated as a protected/never-modify file —
 `README.md`, `PROJECT_PROGRESS.md`, and any other documentation remain
 the files to update for future changes, same as before.
 
+### Step 114 — `runFredAwareRequest()` syntax fix
+
+`providers/fredMacroApplicationService.js` would not parse: `node
+--check` reported "await is only valid in async functions" at the
+`await loadLiveMacroData(...)` call. The cause was 37 lines earlier —
+the `runMarketIntelligenceRequest(...)` delegation block at the top of
+`runFredAwareRequest()` had been pasted twice, and the duplicate
+carried an extra closing brace that ended the `async function` early.
+Everything after it, including that `await`, had become top-level
+module code, which CommonJS does not allow.
+
+Fix: deleted the 12 duplicated lines and the stray brace. No logic,
+comments, or other files changed; the function body now runs to its
+original single closing brace. `node --check` passes and the full
+suite is green.
+
+### Step 115 — documentation resync (this update)
+
+An audit compared this file against the code. `README.md` and
+`HOW_TO_RUN.md` were both found accurate and current. This file was
+not: it predated the entire `llm/` reasoning layer, the
+`/api/market-intelligence` route, and CI activation, and its Standing
+Rules still instructed future work to assume no Anthropic integration
+exists — which would have invited a contributor to remove or bypass
+the isolation machinery that layer depends on. Those four corrections
+are the substance of this revision. No source file was changed by this
+step.
+
+### Step 116 — production deployment configuration
+
+The code was already deployment-ready; nothing was configured. Verified
+first, by live smoke test rather than by reading: with `HOST=0.0.0.0`,
+`npm start` binds to the external interface and `/health` answers `200`
+there (loopback-only default confirmed as the failure mode without it);
+`PORT` is honored from the environment as a string; auth fails closed
+(`401` with no token, `200` with one); `SIGTERM` shuts down gracefully;
+`RUN_STORE_FILE` redirects run records and leaves `data/runs.jsonl`
+untouched; and a container with empty `data/` and `logs/` directories
+starts cleanly and creates both files on demand.
+
+Added (configuration and documentation only — no source file changed):
+
+- `railway.json` — Railpack builder, `npm start`, **`/health` health
+  check**, `ON_FAILURE` restart policy with 10 retries. The health
+  check is the safety-relevant part: without one, a container that
+  booted but is still bound to loopback reports healthy while every
+  request fails.
+- `.nvmrc` pinning Node 22 — the version the suite is verified on.
+  `engines: ">=18"` alone would let a platform default put production
+  on an untested major. CI still covers both 18 and 22.
+- `README.md` — a `## Deployment` section (required platform
+  variables, why `HOST` is not defaulted to `0.0.0.0`, ephemeral
+  filesystem consequences), and an `ANTHROPIC_API_KEY` row added to
+  the "every environment variable this system reads" table, which had
+  omitted it.
+
+Full suite re-run after the change: **1440/1440**.
+
+### Step 117 — git state audit, and `.gitattributes`
+
+Railway deployment was verified live: `/health` returns
+`{"status":"ok"}`, unauthenticated `POST /api/intelligence` returns
+401, authenticated returns 200 with `pipelineResult.ok === true`,
+persistence `PERSISTED`, and `llmAnnotation` `null` with the LLM layer
+off. **The deployed code is commit `92fda34` (`origin/main`), not the
+current working tree**, and the audit below explains what that means.
+
+Git state, read directly from `.git` (refs, reflog, and a parse of the
+index compared against working-tree blob hashes):
+
+- Local `main`, `origin/main`, and tag `v1.1.1` all point at
+  `92fda34` ("fix: accept fenced Claude JSON output"). 20 commits on
+  `main`. CI activation **is** committed (`9b94893`), so
+  `.github/workflows/test.yml` is in the repository.
+- Of 261 tracked files, exactly **two** differ from the index:
+  - `app.js` — **line endings only.** A Windows editor re-saved it as
+    CRLF; content is byte-identical to the committed blob after
+    normalization (9870 bytes LF vs 10050 bytes CRLF, one `\r` per
+    line). No code change.
+  - `providers/fredMacroApplicationService.js` — the committed blob is
+    an **older** revision with no market/news delegation at all. The
+    `options.market`/`options.news` → `runMarketIntelligenceRequest()`
+    branch is uncommitted working-tree work. The duplicated-block
+    corruption fixed in Step 114 therefore **never reached git**; the
+    committed version parses cleanly and passes 1440/1440 on its own
+    (verified by restoring it and re-running the suite), because no
+    test exercises that delegation branch.
+- **`railway.json` and `.nvmrc` are untracked** — they are not in the
+  repository, so the live Railway deployment is not using them. The
+  successful deploy came from variables set in the Railway dashboard,
+  which means the `/health` health check and the Node-22 pin are
+  configured but **not yet active**.
+
+Added: `.gitattributes` with `* text=auto eol=lf`, so line endings are
+normalized in the repository and a Windows working tree stops producing
+whole-file diffs. Added before the first commit from this machine
+specifically so the CRLF noise never enters history. No source file was
+changed.
+
+Full suite after the change: **1440/1440**.
+
+### Step 118 — regression tests for the market/news delegation branch
+
+Step 117 found that `runFredAwareRequest()`'s `options.market` /
+`options.news` delegation to `runMarketIntelligenceRequest()` had no
+test at all. Four were added to
+`providers/fredMacroApplicationService.test.js` (tests 16-19), in the
+file's existing style — injected `fetchImpl` per provider plus the
+existing network guard, which fails the test if the real global
+`fetch` is ever reached. Only one Alpha Vantage domain is enabled per
+test where possible, so the implementation's 1100ms inter-request
+delay (which applies only when market and news are both enabled) never
+triggers and no timer patching was needed.
+
+- **16** — `options.news.enabled` delegates. A news request being
+  issued at all is the proof: the local FRED path never contacts Alpha
+  Vantage.
+- **17** — `options.market.enabled` delegates the same way.
+- **18** — with macro also enabled, `fredDiagnostics` is exactly the
+  delegated service's `diagnostics.macro` (`{ seriesResults, warnings }`),
+  not the whole `diagnostics` object.
+- **19** — the branch's own wiring: a caller using this service's
+  original FRED-style `options.adapterConfig` still reaches the macro
+  loader once delegated (`options.macroAdapterConfig || options.adapterConfig`).
+
+Coverage of `providers/fredMacroApplicationService.js`, measured with
+`node --test --experimental-test-coverage`:
+
+| | lines | branches | uncovered |
+|---|---|---|---|
+| before | 86.25% | 80.00% | 29-39 (the delegation block) |
+| after | **100%** | **94.74%** | none |
+
+Verified by mutation rather than by coverage alone — with the tests in
+place: restoring the older committed revision that has no delegation
+fails 3 of them (it previously failed none); removing only the
+`|| options.adapterConfig` fallback fails exactly test 19; and mapping
+`fredDiagnostics` to the whole `diagnostics` object instead of
+`diagnostics.macro` fails all 4.
+
+Full suite: **1444/1444** (1440 + 4). Only the test file changed; no
+source file was touched.
+
 ## 2. In Progress
 
 Nothing is actively in progress — every capability above is complete
@@ -220,16 +420,40 @@ on anything.
   beyond the Step 15 audit already on record.
 - **No natural-language extraction of existing holdings** —
   `existingPortfolio` must be supplied as structured JSON today.
-- **No actual deployment** to Railway or any other host — only local
-  verification (`npm start` + curl/smoke tests) has been done.
+- **Deployed, but from `origin/main` (`92fda34`), which predates every
+  change made in Steps 114–117.** The service is live and verified, but
+  the FRED market/news delegation, the documentation resync, and the
+  deployment configuration (`railway.json`, `.nvmrc`) are all still
+  local-only. Committing and pushing is the next action.
+- ~~The market/news delegation branch has no test.~~ Covered in Step
+  118 (tests 16-19); the branch is still uncommitted, but it is no
+  longer untested.
 - **No metrics/observability platform integration** — `logs/logger.js`
   covers structured agent- and HTTP-request-level events to a local,
   rotating file; there is no external metrics/APM/log-aggregation
   service wired up.
-- **CI is authored but not active** — `ci/github-actions-test.yml`
-  exists but has not been copied to `.github/workflows/test.yml`, so
-  no workflow currently runs on GitHub Actions (see the Step 106 note
-  above).
+- **No prompt-template registry for the LLM layer** —
+  `llm/reasoningService.js` carries a single inline system prompt and
+  says so in its own header. The versioned registry proposed in
+  `LLM_REASONING_LAYER_DESIGN.md` §4 (`llm/promptRegistry.js`,
+  `llm/prompts/reasoning-v1.md`) is a disclosed, deliberate gap, not
+  an oversight. Every candidate output is validated identically
+  regardless of how it was prompted.
+- **The LLM layer has never made a real Anthropic call** — every test
+  injects a mock transport, by design. The pinned model ID
+  (`claude-sonnet-5`) was confirmed valid and genuinely pinned rather
+  than a moving alias, but a first real call against a live key
+  remains unexercised.
+- **`npm test` writes to the production `logs/system.log`** — the ~30
+  `logEvent()` call sites in the agents and orchestrator use the
+  default path, so a full suite run appends roughly 0.5 MB and, after
+  enough runs, rotates real operational history out through
+  `system.log.1..3`. `logEvent()` already accepts a
+  `testOptions.logFilePath` override, but `server.test.js`
+  deliberately reads the real `LOG_FILE` to assert request logging and
+  `tests/logger.test.js` explicitly asserts `LOG_FILE` is never a test
+  path — so redirecting it is a design decision, not a bug fix, and
+  was left alone here. Noted for a future step.
 
 ## 4. Future Planned Work (not started, not scheduled)
 
@@ -247,7 +471,11 @@ only to record known open questions, not a roadmap commitment.
 ## Standing Rules (unchanged, apply to every future step)
 
 - Never modify CafeBot or any file outside this project.
-- No LLM/Claude/Anthropic integration exists or should be assumed.
+- The Claude/Anthropic reasoning layer under `llm/` is **advisory
+  only**. It stays opt-in and off by default, runs only after the
+  deterministic pipeline is final, and must never be allowed to
+  influence `risk_decision`, `decision_status`, or
+  `final_assessment`. Never widen it into the decision path.
 - Never implement real-money trading, broker/exchange connection, or
   automatic trade execution.
 - Never hardcode a credential; every secret is read from an environment

@@ -1,0 +1,26 @@
+# Normalize line endings. Added in Step 117, before the first commit
+# made from a Windows working tree.
+#
+# Why: app.js was re-saved by a Windows editor and switched from LF to
+# CRLF. Its content did not change by a single character, but every one
+# of its 180 lines then showed as modified — 9870 bytes committed vs
+# 10050 bytes on disk, the difference being exactly one \r per line.
+# Committing that would have written a 180-line diff into the history of
+# this project's most safety-critical wiring file for no semantic
+# change, and would have repeated for every file any Windows editor
+# touched.
+#
+# `text=auto eol=lf` tells git to store every text file with LF in the
+# repository regardless of what the working tree uses, so the working
+# copy can keep CRLF locally and still produce clean diffs. The repo has
+# no binary files today; the explicit entries below simply make the
+# intent unambiguous for the file types that exist.
+* text=auto eol=lf
+
+*.js   text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.example text eol=lf
+.gitignore text eol=lf
+.nvmrc text eol=lf

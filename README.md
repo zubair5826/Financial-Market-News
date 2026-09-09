@@ -354,6 +354,7 @@ credentials exist in this repo in any environment.**
 |---|---|---|
 | `FRED_API_KEY` | `providers/fredMacroLiveSource.js` | Macro live calls return `AUTH_FAILURE`; never fabricated data |
 | `ALPHAVANTAGE_API_KEY` | `providers/alphaVantage*LiveSource.js` | Market/news live calls return `AUTH_FAILURE` |
+| `ANTHROPIC_API_KEY` | `llm/anthropicLiveSource.js` | The opt-in reasoning layer returns a non-`VALID` `llmAnnotation`; the deterministic result is unaffected |
 | `API_AUTH_TOKEN` | `server.js` | **Fails closed** — every API request is rejected with 401 |
 | `PORT` | `server.js` | `3000` |
 | `HOST` | `server.js` | `127.0.0.1` (loopback only). Container/cloud platforms need `HOST=0.0.0.0` |
@@ -361,6 +362,41 @@ credentials exist in this repo in any environment.**
 | `RATE_LIMIT_WINDOW_MS` | `server.js` | `60000` |
 | `RATE_LIMIT_MAX_REQUESTS` | `server.js` | `30` |
 | `RUN_STORE_FILE` | `server.js` | `data/runs.jsonl` |
+
+## Deployment
+
+[`railway.json`](railway.json) configures the build (Railpack), the
+start command (`npm start`), a `/health` health check, and an
+`ON_FAILURE` restart policy. [`.nvmrc`](.nvmrc) pins the Node major to
+22 — the version the suite is verified on — so a platform default
+cannot silently move production onto an untested major. There is
+nothing to install: the project has zero npm dependencies.
+
+**Variables that must be set on the platform before the first deploy:**
+
+| Variable | Value | Why |
+|---|---|---|
+| `HOST` | `0.0.0.0` | **Required.** The default is loopback-only, so without this the container starts, the health check never reaches it, and the deploy fails. See the note below. |
+| `API_AUTH_TOKEN` | a strong random secret | **Required.** Auth fails closed — unset means every API request returns 401. |
+| `TRUST_PROXY` | `1` | Required *behind Railway's proxy*, which overwrites `X-Forwarded-For`. Without it every request is attributed to the proxy's single IP, so all clients share one rate-limit bucket. Never set it where no such proxy exists — that re-opens the bypass fixed in Step 106. |
+| `FRED_API_KEY` | real key | Only if live macro data is wanted. |
+| `ALPHAVANTAGE_API_KEY` | real key | Only if live technical/news data is wanted. |
+| `ANTHROPIC_API_KEY` | real key | Only if callers will use `options.llm.enabled`. |
+
+`PORT` is injected by the platform and needs no manual value.
+
+**Why `HOST` is not defaulted to `0.0.0.0`:** binding a process that
+holds real provider credentials to every interface is the unsafe
+default, so it stays an explicit opt-in. The startup banner names the
+requirement, and the health check above turns a forgotten `HOST` into
+a failed deploy rather than a silently unreachable service.
+
+**Filesystem is ephemeral.** `data/runs.jsonl` and `logs/system.log`
+live in the container and are lost on every redeploy and restart. Both
+directories are created on demand, so a clean container starts without
+error. To keep run history, mount a volume and point `RUN_STORE_FILE`
+at it. Log output has no equivalent override today — see Known
+Limitations.
 
 ## HTTP API (`server.js`)
 

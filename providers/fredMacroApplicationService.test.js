@@ -296,3 +296,161 @@ test("the service file never references fetch(), http/https require(), process.e
   assert.ok(!/process\.env/.test(codeOnly));
   assert.ok(!/["'][A-Za-z0-9]{20,}["']/.test(codeOnly));
 });
+
+// --- Tests 16-19: the options.market / options.news delegation branch ---
+//
+// runFredAwareRequest() hands the whole request to
+// runMarketIntelligenceRequest() as soon as options.market.enabled or
+// options.news.enabled is true, and maps that service's
+// diagnostics.macro onto its own fredDiagnostics field. Before these
+// tests nothing exercised that branch at all: restoring the older
+// committed revision of fredMacroApplicationService.js, which has no
+// delegation, left the whole suite green.
+//
+// These tests stay offline the same way every test above does — an
+// injected fetchImpl per provider plus the network guard, which fails
+// the test if the real global fetch is ever reached. Only ONE Alpha
+// Vantage domain is enabled per test, so the implementation's 1100ms
+// inter-request delay (which applies only when market and news are
+// both enabled) is never triggered and no timer patching is needed.
+
+const SYNTHETIC_AV_KEY = "SYNTHETIC_AV_KEY";
+
+// Alpha Vantage response bodies, matching the shapes already used in
+// providers/marketIntelligenceApplicationService.test.js.
+function marketDailyBody() {
+  return { "Time Series (Daily)": { "2026-08-24": { "1. open": "560.10", "2. high": "563.50", "3. low": "559.00", "4. close": "562.20", "5. volume": "45012345" } } };
+}
+
+function newsFeedBody() {
+  return {
+    items: "1",
+    feed: [
+      {
+        title: "SPY hits new high as market rallies",
+        url: "https://example.com/article-1",
+        time_published: "20260824T093000",
+        summary: "The S&P 500 ETF rose sharply amid strong earnings.",
+        source: "Example Financial News",
+        topics: [{ topic: "financial_markets", relevance_score: "0.9" }],
+        ticker_sentiment: [{ ticker: "SPY", relevance_score: "0.85", ticker_sentiment_score: "0.3", ticker_sentiment_label: "Somewhat-Bullish" }],
+      },
+    ],
+  };
+}
+
+function makeAlphaVantageMockFetch(body, onCall) {
+  return async (url) => {
+    if (onCall) onCall(url);
+    return jsonResponse(200, body);
+  };
+}
+
+async function withAlphaVantageKey(value, fn) {
+  const original = process.env.ALPHAVANTAGE_API_KEY;
+  if (value === undefined) delete process.env.ALPHAVANTAGE_API_KEY;
+  else process.env.ALPHAVANTAGE_API_KEY = value;
+  try {
+    return await fn();
+  } finally {
+    if (original === undefined) delete process.env.ALPHAVANTAGE_API_KEY;
+    else process.env.ALPHAVANTAGE_API_KEY = original;
+  }
+}
+
+// 16. news alone triggers delegation. The local FRED path never
+// contacts Alpha Vantage, so a news request having been issued at all
+// is proof the call went through runMarketIntelligenceRequest().
+test("16. options.news.enabled delegates to runMarketIntelligenceRequest (news acquired, fredDiagnostics null because macro is off)", async () => {
+  await withAlphaVantageKey(SYNTHETIC_AV_KEY, async () => {
+    const newsCalls = [];
+    const { value: result, networkCalled } = await withNetworkGuard(async () =>
+      runFredAwareRequest(validBaseRequest({ asset: "SPY" }), {
+        news: { enabled: true },
+        newsAdapterConfig: { fetchImpl: makeAlphaVantageMockFetch(newsFeedBody(), (u) => newsCalls.push(u)) },
+      })
+    );
+    assert.equal(networkCalled, false);
+    assert.equal(newsCalls.length, 1);
+    assert.equal(result.pipelineResult.ok, true);
+    // diagnostics exists (delegation happened) but its macro slot is
+    // null because options.macro was never enabled.
+    assert.equal(result.fredDiagnostics, null);
+  });
+});
+
+// 17. market alone triggers the same delegation.
+test("17. options.market.enabled delegates to runMarketIntelligenceRequest (market acquired, fredDiagnostics null because macro is off)", async () => {
+  await withAlphaVantageKey(SYNTHETIC_AV_KEY, async () => {
+    const marketCalls = [];
+    const { value: result, networkCalled } = await withNetworkGuard(async () =>
+      runFredAwareRequest(validBaseRequest({ asset: "SPY" }), {
+        market: { enabled: true },
+        marketAdapterConfig: { fetchImpl: makeAlphaVantageMockFetch(marketDailyBody(), (u) => marketCalls.push(u)) },
+      })
+    );
+    assert.equal(networkCalled, false);
+    assert.ok(marketCalls.length >= 1);
+    assert.equal(result.pipelineResult.ok, true);
+    assert.equal(result.fredDiagnostics, null);
+  });
+});
+
+// 18. The mapping itself: fredDiagnostics must be the delegated
+// service's diagnostics.macro, not a null placeholder and not the
+// whole diagnostics object.
+test("18. with macro also enabled, fredDiagnostics is the delegated service's diagnostics.macro", async () => {
+  await withEnvKey(SYNTHETIC_KEY, async () =>
+    withAlphaVantageKey(SYNTHETIC_AV_KEY, async () => {
+      const fredCalls = [];
+      const newsCalls = [];
+      const { value: result, networkCalled } = await withNetworkGuard(async () =>
+        runFredAwareRequest(validBaseRequest({ asset: "SPY" }), {
+          macro: { enabled: true },
+          news: { enabled: true },
+          macroAdapterConfig: { fetchImpl: makeMockFetch(successfulFredMocks((u) => fredCalls.push(u))) },
+          newsAdapterConfig: { fetchImpl: makeAlphaVantageMockFetch(newsFeedBody(), (u) => newsCalls.push(u)) },
+        })
+      );
+      assert.equal(networkCalled, false);
+      assert.ok(fredCalls.length >= 1, "the FRED mock must have been reached through the delegated call");
+      assert.equal(newsCalls.length, 1);
+      assert.equal(result.pipelineResult.ok, true);
+      // Exactly the macro slot's shape — { seriesResults, warnings } —
+      // and none of diagnostics' sibling keys (instrument/market/news).
+      assert.ok(result.fredDiagnostics !== null);
+      assert.ok(Array.isArray(result.fredDiagnostics.seriesResults));
+      assert.ok(Array.isArray(result.fredDiagnostics.warnings));
+      assert.equal(result.fredDiagnostics.instrument, undefined);
+      assert.equal(result.fredDiagnostics.news, undefined);
+    })
+  );
+});
+
+// 19. The branch's own wiring: a caller using this service's original
+// FRED-style options.adapterConfig (not the market service's
+// macroAdapterConfig name) must still have it reach the macro loader
+// once the request is delegated. This is the line
+// `macroAdapterConfig: options.macroAdapterConfig || options.adapterConfig`
+// and nothing else in the suite covers it.
+test("19. delegation forwards the FRED-style options.adapterConfig as macroAdapterConfig", async () => {
+  await withEnvKey(SYNTHETIC_KEY, async () =>
+    withAlphaVantageKey(SYNTHETIC_AV_KEY, async () => {
+      const fredCalls = [];
+      const { value: result, networkCalled } = await withNetworkGuard(async () =>
+        runFredAwareRequest(validBaseRequest({ asset: "SPY" }), {
+          macro: { enabled: true },
+          news: { enabled: true },
+          // Deliberately the OLD option name — no macroAdapterConfig.
+          adapterConfig: { fetchImpl: makeMockFetch(successfulFredMocks((u) => fredCalls.push(u))) },
+          newsAdapterConfig: { fetchImpl: makeAlphaVantageMockFetch(newsFeedBody()) },
+        })
+      );
+      assert.equal(networkCalled, false);
+      assert.ok(fredCalls.length >= 1, "options.adapterConfig must reach FRED through the delegated call");
+      assert.equal(result.pipelineResult.ok, true);
+      assert.ok(result.fredDiagnostics !== null);
+      assert.ok(Array.isArray(result.fredDiagnostics.seriesResults));
+    })
+  );
+});
