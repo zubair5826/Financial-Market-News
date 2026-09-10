@@ -198,7 +198,16 @@ async function runMarketIntelligenceRequest(request, options = {}) {
     market: marketEnabled
       ? { providerResult: marketResult.providerResult, timeframeResults: marketResult.timeframeResults, warnings: marketResult.warnings }
       : null,
-    news: newsEnabled ? { providerResult: newsResult.providerResult, warnings: newsResult.warnings } : null,
+    // Preserve the news provider's relevance-filter accounting alongside
+    // its result and warnings so API callers can see how many records were
+    // excluded without reconstructing it from the raw feed.
+    news: newsEnabled
+      ? {
+          providerResult: newsResult.providerResult,
+          warnings: newsResult.warnings,
+          relevanceFilter: newsResult.relevanceFilter,
+        }
+      : null,
   };
 
   return { pipelineResult, diagnostics };

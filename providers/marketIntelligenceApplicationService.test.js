@@ -247,6 +247,12 @@ test("4. news only: news live source invoked once, macro/market not invoked, one
     assert.equal(result.diagnostics.macro, null);
     assert.equal(result.diagnostics.market, null);
     assert.ok(result.diagnostics.news);
+    assert.deepEqual(result.diagnostics.news.relevanceFilter, {
+      threshold: 0.1,
+      examined: 1,
+      filtered: 0,
+      retained: 1,
+    });
   });
 });
 
