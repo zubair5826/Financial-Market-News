@@ -247,10 +247,18 @@ test("4. news only: news live source invoked once, macro/market not invoked, one
     assert.equal(result.diagnostics.macro, null);
     assert.equal(result.diagnostics.market, null);
     assert.ok(result.diagnostics.news);
+    // Steps 107/108: the threshold is 0.3 and relevanceFilter now reports the
+    // two filter stages separately (filteredByThreshold / filteredByPattern,
+    // with patternCounts attributing each page-type exclusion by rule name).
+    // `filtered` remains the combined total. This fixture is one genuine,
+    // well-scored news record, so nothing is excluded by either stage.
     assert.deepEqual(result.diagnostics.news.relevanceFilter, {
-      threshold: 0.1,
+      threshold: 0.3,
       examined: 1,
       filtered: 0,
+      filteredByThreshold: 0,
+      filteredByPattern: 0,
+      patternCounts: {},
       retained: 1,
     });
   });

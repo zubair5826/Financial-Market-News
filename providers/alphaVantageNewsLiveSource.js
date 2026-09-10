@@ -55,16 +55,18 @@ const NEWS_LIMIT = 10;
 // here; that would be exactly the kind of invented rule this project
 // refuses to make (see agents/news-agent/duplicates.js's own reasoning).
 //
-// THRESHOLD: deliberately at the conservative (low) end. 0.1 removes
-// only the clearly-irrelevant tail — a passing mention — and leaves
-// every borderline article in, because wrongly discarding a real story
-// is worse here than passing one extra weak one downstream. Raise it
-// only with evidence from observed filtered counts.
+// THRESHOLD: 0.3, raised from the initial conservative 0.1 by project-owner
+// decision after the first live production run. 0.1 removed only the
+// clearly-irrelevant tail; 0.3 also removes the weak-mention band, where an
+// article names the ticker without being about it. This is a deliberate
+// trade: it discards more genuine but marginal broad-market coverage in
+// exchange for a cleaner feed. See the module note below on what that costs.
 //
-// A record with NO usable relevance_score is never filtered. Absence of
-// provider tagging is not evidence of irrelevance, the same rule the
-// requested-ticker confirmation below already follows.
-const MIN_TICKER_RELEVANCE_SCORE = 0.1;
+// A record with NO usable relevance_score is never filtered BY SCORE.
+// Absence of provider tagging is not evidence of irrelevance, the same rule
+// the requested-ticker confirmation below already follows. Such a record can
+// still be excluded by the explicit page-type patterns (Step 108).
+const MIN_TICKER_RELEVANCE_SCORE = 0.3;
 
 // Returns the provider's numeric relevance score for a mapped record, or
 // null when the record carries no usable score. Never coerces a missing,
@@ -78,6 +80,93 @@ function readTickerRelevanceScore(record) {
   if (typeof raw !== "string" || raw.trim() === "") return null;
   const parsed = Number(raw);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+// --- Step 108: explicit non-news page-type exclusions ---
+//
+// A SECOND, NARROWER filter, added by project-owner decision after the first
+// live production run showed that Alpha Vantage's NEWS_SENTIMENT feed carries
+// entries that are not news articles at all — they are reference/utility
+// pages that merely mention the ticker: currency-conversion tables, tokenized
+// -product listings, fund holdings-history pages, price-prediction pages, and
+// pages from venues that publish these in bulk.
+//
+// SCOPE, deliberately narrow. Each pattern below identifies a PAGE TYPE by
+// its title/URL/source shape. None of them reads an article's meaning, tone,
+// sentiment or subject matter — that judgment stays exactly where it already
+// lives (the provider's own tagging), and this project still never infers
+// impact or relevance from headline wording. This is closer to a robots/
+// content-type filter than to an editorial one.
+//
+// KNOWN COST, accepted with the decision: a title-shaped rule cannot
+// distinguish a price-prediction PAGE from a genuine article that happens to
+// discuss a price forecast. Every pattern here can produce a false exclusion.
+// That is why each match is counted and attributed by name in
+// relevanceFilter.patternCounts below — so a pattern that starts eating real
+// coverage is visible in diagnostics rather than silently discarding it.
+//
+// Patterns are matched case-insensitively against the record's headline, URL
+// and source combined. Anchored to distinctive multi-word/structural shapes
+// rather than bare keywords, so a normal news headline that merely uses one
+// of these words is not caught.
+const NON_NEWS_PATTERNS = Object.freeze([
+  // "SPY to USD", "Convert 1 SPY to EUR", "... currency conversion rates",
+  // and /convert/ URL paths. Requires the ticker-to-currency shape or an
+  // explicit conversion phrase — never a bare currency code.
+  {
+    name: "currency_conversion",
+    pattern:
+      /(currency[- ]conversion|conversion rate|exchange rate calculator|\bconvert\s+[\w.$]{1,12}\s+to\b|\b[\w.$]{1,8}\s+to\s+(usd|eur|gbp|jpy|inr|cad|aud|chf|cny|brl|mxn|krw|sgd|hkd)\b|\/convert\/|\/currency-conver)/,
+  },
+  // Tokenized / wrapped equity products tracking the ticker.
+  {
+    name: "tokenized_product",
+    // The optional {0,2} word gap lets a ticker sit between the qualifier and
+    // the instrument word ("wrapped SPY ETF"), without letting the two halves
+    // drift arbitrarily far apart in an unrelated sentence.
+    pattern:
+      /(tokeni[sz](e|ed|es|ing|ation)|security token|\b(wrapped|on-chain)\s+([\w.$]{1,8}\s+){0,2}(stocks?|equit(y|ies)|shares?|etfs?)\b)/,
+  },
+  // Fund/institutional holdings-history reference pages.
+  {
+    name: "holdings_history",
+    pattern: /(holdings?[- ]history|history of holdings|\bportfolio holdings\b|\/holdings[-\/]|position history)/,
+  },
+  // Price-prediction / forecast-for-YEAR pages.
+  {
+    name: "price_prediction",
+    pattern: /(price prediction|price forecast|stock forecast|\b(prediction|forecast)s?\s+(for\s+)?20\d\d\b|\bwhere will .+ be in 20\d\d|\/price-prediction)/,
+  },
+  // Backpack Securities / Backpack Exchange listing pages.
+  {
+    name: "backpack_securities",
+    pattern: /(backpack\s+(securities|exchange)|\bbackpack\.exchange\b|\/backpack[-\/])/,
+  },
+]);
+
+// The text a page-type pattern is matched against: headline, URL and source
+// together, lowercased. Source is included because some exclusions
+// (backpack_securities) are venue-level rather than title-level. UNKNOWN
+// placeholders contribute nothing.
+function nonNewsHaystack(record) {
+  if (!record || typeof record !== "object") return "";
+  return [record.headline, record.url_or_reference, record.source]
+    .filter((value) => typeof value === "string" && value && value !== "UNKNOWN")
+    .join(" \n ")
+    .toLowerCase();
+}
+
+// Returns the NAME of the first matching non-news page-type pattern, or null
+// when the record does not look like one of those page types. Returning the
+// name (never just a boolean) is what lets diagnostics attribute every
+// pattern exclusion to the specific rule that caused it.
+function matchNonNewsPattern(record) {
+  const haystack = nonNewsHaystack(record);
+  if (!haystack) return null;
+  for (const { name, pattern } of NON_NEWS_PATTERNS) {
+    if (pattern.test(haystack)) return name;
+  }
+  return null;
 }
 
 // options.symbol: the resolved instrument symbol to request (e.g. from
@@ -137,48 +226,86 @@ async function loadLiveNewsData(options = {}) {
     };
   }
 
-  // Step 107: provider-scored relevance filter, applied AFTER the
-  // requested-ticker confirmation above so that check still sees the
-  // whole feed exactly as before, and BEFORE anything downstream sees a
-  // record. Nothing is rewritten, rescored or merged — a record is
-  // either passed through byte-for-byte or excluded and counted.
+  // Steps 107/108: the two-stage relevance filter, applied AFTER the
+  // requested-ticker confirmation above so that check still sees the whole
+  // feed exactly as before, and BEFORE anything downstream sees a record.
+  // Nothing is rewritten, rescored or merged — a record is either passed
+  // through byte-for-byte or excluded, counted, and attributed.
+  //
+  // ORDER: page-type patterns run FIRST, and apply to every record whether or
+  // not it carries a usable relevance_score — a currency-conversion page is
+  // not news at any score. The numeric threshold runs SECOND and, as before,
+  // only ever excludes a record that actually has a score to judge.
   const retained = [];
-  let filteredCount = 0;
+  const patternCounts = {};
+  let filteredByPattern = 0;
+  let filteredByThreshold = 0;
+
   for (const record of records) {
-    const score = readTickerRelevanceScore(record);
-    if (score !== null && score < MIN_TICKER_RELEVANCE_SCORE) {
-      filteredCount += 1;
+    const patternName = matchNonNewsPattern(record);
+    if (patternName) {
+      filteredByPattern += 1;
+      patternCounts[patternName] = (patternCounts[patternName] || 0) + 1;
       continue;
     }
+
+    const score = readTickerRelevanceScore(record);
+    if (score !== null && score < MIN_TICKER_RELEVANCE_SCORE) {
+      filteredByThreshold += 1;
+      continue;
+    }
+
     retained.push(record);
   }
 
-  // Never silent: an excluded record is always reported as a count in
-  // warnings (which marketIntelligenceApplicationService.js already
-  // surfaces as diagnostics.news.warnings) and in the additive
-  // relevanceFilter field below. Headlines are deliberately not listed —
-  // the count is the operational fact; the full feed is one provider
-  // call away if an operator needs to inspect it.
-  const warnings =
-    filteredCount > 0
-      ? [
-          `Alpha Vantage news relevance filter: ${filteredCount} of ${records.length} record(s) excluded for "${tickers}" — provider ticker relevance_score below ${MIN_TICKER_RELEVANCE_SCORE}.`,
-        ]
-      : [];
+  const filteredCount = filteredByPattern + filteredByThreshold;
+
+  // Never silent: every exclusion is reported as a count in warnings (which
+  // marketIntelligenceApplicationService.js already surfaces as
+  // diagnostics.news.warnings) and in the relevanceFilter field below, with
+  // the two stages reported separately so it is always clear WHICH rule
+  // removed a record. Headlines are deliberately not listed — the counts are
+  // the operational fact; the full feed is one provider call away if an
+  // operator needs to inspect it.
+  const warnings = [];
+  if (filteredByThreshold > 0) {
+    warnings.push(
+      `Alpha Vantage news relevance filter: ${filteredByThreshold} of ${records.length} record(s) excluded for "${tickers}" — provider ticker relevance_score below ${MIN_TICKER_RELEVANCE_SCORE}.`
+    );
+  }
+  if (filteredByPattern > 0) {
+    const breakdown = Object.keys(patternCounts)
+      .sort()
+      .map((name) => `${name}=${patternCounts[name]}`)
+      .join(", ");
+    warnings.push(
+      `Alpha Vantage news page-type filter: ${filteredByPattern} of ${records.length} record(s) excluded for "${tickers}" — non-news page types (${breakdown}).`
+    );
+  }
 
   return {
     newsData: retained,
     providerResult: { ok: true, recordCount: retained.length },
     warnings,
     // Additive diagnostic field — no existing caller reads it, and every
-    // pre-existing field above keeps its exact shape.
+    // pre-existing field above keeps its exact shape. `filtered` remains the
+    // combined total; the per-stage counts are additive alongside it.
     relevanceFilter: {
       threshold: MIN_TICKER_RELEVANCE_SCORE,
       examined: records.length,
       filtered: filteredCount,
+      filteredByThreshold,
+      filteredByPattern,
+      patternCounts,
       retained: retained.length,
     },
   };
 }
 
-module.exports = { loadLiveNewsData, MIN_TICKER_RELEVANCE_SCORE, readTickerRelevanceScore };
+module.exports = {
+  loadLiveNewsData,
+  MIN_TICKER_RELEVANCE_SCORE,
+  readTickerRelevanceScore,
+  NON_NEWS_PATTERNS,
+  matchNonNewsPattern,
+};
