@@ -42,6 +42,7 @@ const { UNKNOWN } = require("../../core/constants");
 const { INFORMATION_CLASSIFICATIONS } = require("../../core/classification");
 const { IMPACT_DIRECTIONS } = require("../../agents/news-agent/impact");
 const { failSafe, ERROR_CODES } = require("../../core/errors");
+const { symbolsMatch } = require("../instrumentContext");
 
 const ALPHA_VANTAGE_BASE_URL = "https://www.alphavantage.co/query";
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -96,7 +97,7 @@ class AlphaVantageNewsAdapter extends ProviderAdapter {
     }
 
     const retrievedTimestamp = new Date().toISOString();
-    return { ok: true, data: this.#mapToNewsRecords(body.feed, retrievedTimestamp) };
+    return { ok: true, data: this.#mapToNewsRecords(body.feed, retrievedTimestamp, tickers) };
   }
 
   // Reuses fetchData() itself, same as AlphaVantageMarketAdapter —
@@ -171,7 +172,7 @@ class AlphaVantageNewsAdapter extends ProviderAdapter {
   // Rejects a feed item clearly (by excluding it) rather than
   // fabricating a headline — mirrors the News Agent's own rule that a
   // missing headline leaves nothing to process.
-  #mapToNewsRecords(feed, retrievedTimestamp) {
+  #mapToNewsRecords(feed, retrievedTimestamp, requestedTicker) {
     const records = [];
 
     for (const item of feed) {
@@ -188,7 +189,19 @@ class AlphaVantageNewsAdapter extends ProviderAdapter {
       // Sentiment specific to the requested ticker if tagged, else the
       // first tagged ticker present — never invented if the array is
       // empty or doesn't include the requested symbol.
-      const tickerSentiment = tickerSentiments.find((t) => t && t.ticker === DEFAULT_TICKERS) || tickerSentiments[0];
+      //
+      // Step 107 fix: this previously compared against the DEFAULT_TICKERS
+      // constant ("SPY") rather than the ticker actually requested. Step 99
+      // made the REQUEST symbol caller-supplied, but this mapping line was
+      // left behind, so a request for any other instrument would attach
+      // SPY's sentiment when SPY happened to be tagged in the article, and
+      // otherwise fall through to whichever ticker the provider listed
+      // first — an unrelated company's sentiment presented as the requested
+      // instrument's. Matching now uses the shared, existing
+      // instrumentContext.symbolsMatch() (case/whitespace-insensitive,
+      // otherwise exact) rather than a second, private comparison rule.
+      const tickerSentiment =
+        tickerSentiments.find((t) => t && symbolsMatch(requestedTicker, t.ticker)) || tickerSentiments[0];
       const impactDirection =
         tickerSentiment && typeof tickerSentiment.ticker_sentiment_label === "string"
           ? SENTIMENT_LABEL_MAP[tickerSentiment.ticker_sentiment_label] || UNKNOWN

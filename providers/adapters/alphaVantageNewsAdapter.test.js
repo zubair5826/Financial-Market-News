@@ -299,3 +299,73 @@ test("16. no unit test in this file ever performs a real network call", async ()
   });
   assert.equal(networkCalled, false);
 });
+
+// --- Step 107: the requested ticker drives sentiment selection ---
+//
+// Regression tests for the fix to a mapping line that compared each
+// article's ticker_sentiment entries against the hard-coded
+// DEFAULT_TICKERS constant ("SPY") instead of the ticker actually
+// requested. Step 99 made the REQUEST symbol caller-supplied; this line
+// was left behind.
+
+// A non-SPY request must read ITS OWN ticker's sentiment, even when the
+// article also carries a SPY entry pointing the opposite way.
+test("107-1. a request for MSFT selects MSFT's ticker_sentiment, not the hard-coded SPY entry", async () => {
+  const mixedItem = sampleItem({
+    title: "Microsoft earnings beat; broad market slips",
+    ticker_sentiment: [
+      { ticker: "SPY", relevance_score: "0.80", ticker_sentiment_score: "-0.4", ticker_sentiment_label: "Bearish" },
+      { ticker: "MSFT", relevance_score: "0.95", ticker_sentiment_score: "0.5", ticker_sentiment_label: "Bullish" },
+    ],
+  });
+  const adapter = makeAdapter({ fetchImpl: makeMockFetch({ body: feedBody([mixedItem]) }) });
+  const result = await adapter.fetchData({ tickers: "MSFT", limit: 10 });
+
+  const record = result.data[0];
+  assert.equal(record.evidence.alpha_vantage_ticker_sentiment.ticker, "MSFT");
+  assert.equal(record.evidence.alpha_vantage_ticker_sentiment.relevance_score, "0.95");
+  // Before the fix the SPY entry won the lookup and this was NEGATIVE —
+  // another instrument's sentiment presented as MSFT's.
+  assert.equal(record.impact_direction, "POSITIVE");
+});
+
+// Matching is case/whitespace-insensitive via the shared
+// instrumentContext.symbolsMatch(), never a second private rule.
+test("107-2. requested-ticker matching is case-insensitive, using the shared symbolsMatch rule", async () => {
+  const item = sampleItem({
+    ticker_sentiment: [{ ticker: "msft", relevance_score: "0.9", ticker_sentiment_score: "0.4", ticker_sentiment_label: "Bullish" }],
+  });
+  const adapter = makeAdapter({ fetchImpl: makeMockFetch({ body: feedBody([item]) }) });
+  const result = await adapter.fetchData({ tickers: "MSFT", limit: 10 });
+  assert.equal(result.data[0].evidence.alpha_vantage_ticker_sentiment.ticker, "msft");
+  assert.equal(result.data[0].impact_direction, "POSITIVE");
+});
+
+// The pre-existing SPY behavior is unchanged by the fix.
+test("107-3. existing SPY behavior is unchanged — a SPY request still selects the SPY entry", async () => {
+  const adapter = makeAdapter({ fetchImpl: makeMockFetch({ body: feedBody([sampleItem()]) }) });
+  const result = await adapter.fetchData({ tickers: "SPY", limit: 10 });
+  const record = result.data[0];
+  assert.equal(record.evidence.alpha_vantage_ticker_sentiment.ticker, "SPY");
+  assert.equal(record.evidence.alpha_vantage_ticker_sentiment.relevance_score, "0.85");
+  assert.equal(record.impact_direction, "POSITIVE");
+});
+
+// When the requested ticker is not tagged at all, the existing
+// first-tagged-entry fallback is preserved — nothing is invented, and
+// nothing newly throws.
+test("107-4. when the requested ticker is absent from ticker_sentiment, the existing first-entry fallback is preserved", async () => {
+  const item = sampleItem({
+    ticker_sentiment: [{ ticker: "AAPL", relevance_score: "0.7", ticker_sentiment_score: "0.2", ticker_sentiment_label: "Somewhat-Bullish" }],
+  });
+  const adapter = makeAdapter({ fetchImpl: makeMockFetch({ body: feedBody([item]) }) });
+  const result = await adapter.fetchData({ tickers: "MSFT", limit: 10 });
+  assert.equal(result.data[0].evidence.alpha_vantage_ticker_sentiment.ticker, "AAPL");
+});
+
+// The frozen Step 44A/44B confidence decision is untouched by this fix.
+test("107-5. impact_confidence remains exactly UNKNOWN after the requested-ticker fix", async () => {
+  const adapter = makeAdapter({ fetchImpl: makeMockFetch({ body: feedBody([sampleItem()]) }) });
+  const result = await adapter.fetchData({ tickers: "MSFT", limit: 10 });
+  assert.equal(result.data[0].impact_confidence, UNKNOWN);
+});

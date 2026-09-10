@@ -193,3 +193,173 @@ test("99-4. a feed with no ticker_sentiment tagging at all is accepted, not trea
     assert.equal(result.newsData.length, 1);
   });
 });
+
+// --- Step 107: provider-scored relevance filter ---
+//
+// Regression tests for the filter that excludes clearly low-relevance
+// Alpha Vantage records using the provider's OWN ticker relevance_score,
+// before anything downstream sees them. No test here asserts on headline
+// wording — the filter reads only the provider's numeric score.
+
+const { MIN_TICKER_RELEVANCE_SCORE } = require("./alphaVantageNewsLiveSource");
+
+// Builds an item tagged for `ticker` at an explicit provider relevance score.
+function scoredItem(ticker, relevanceScore, overrides = {}) {
+  return sampleItem({
+    ticker_sentiment: [
+      { ticker, relevance_score: String(relevanceScore), ticker_sentiment_score: "0.3", ticker_sentiment_label: "Somewhat-Bullish" },
+    ],
+    ...overrides,
+  });
+}
+
+// The threshold is an explicit, inspectable constant, not a magic number
+// buried in a comparison.
+test("107-1. the relevance threshold is exported as an explicit constant in the 0-1 provider range", () => {
+  assert.equal(typeof MIN_TICKER_RELEVANCE_SCORE, "number");
+  assert.ok(MIN_TICKER_RELEVANCE_SCORE > 0 && MIN_TICKER_RELEVANCE_SCORE < 1);
+});
+
+// A clearly low-relevance record — the tokenized/currency/holdings-page
+// class Alpha Vantage tags with SPY — is excluded before downstream.
+test("107-2. a record scored below the threshold is excluded from newsData", async () => {
+  await withEnvKey(SYNTHETIC_KEY, async () => {
+    const lowItem = scoredItem("SPY", 0.02, { title: "SPY to EUR currency conversion rates" });
+    const result = await loadLiveNewsData({
+      adapterConfig: { fetchImpl: makeMockFetch({ body: feedBody([lowItem]) }) },
+    });
+    assert.deepEqual(result.newsData, []);
+    assert.equal(result.providerResult.ok, true);
+    assert.equal(result.providerResult.recordCount, 0);
+  });
+});
+
+// A sufficiently relevant record is retained, byte-for-byte.
+test("107-3. a record scored at or above the threshold is retained unchanged", async () => {
+  await withEnvKey(SYNTHETIC_KEY, async () => {
+    const highItem = scoredItem("SPY", 0.85);
+    const result = await loadLiveNewsData({
+      adapterConfig: { fetchImpl: makeMockFetch({ body: feedBody([highItem]) }) },
+    });
+    assert.equal(result.newsData.length, 1);
+    assert.equal(result.newsData[0].headline, highItem.title);
+    assert.equal(result.newsData[0].evidence.alpha_vantage_ticker_sentiment.relevance_score, "0.85");
+    assert.deepEqual(result.warnings, []);
+  });
+});
+
+// A record scored exactly AT the threshold is kept — the rule is
+// "below the threshold", never "at or below".
+test("107-4. a record scored exactly at the threshold is retained, not filtered", async () => {
+  await withEnvKey(SYNTHETIC_KEY, async () => {
+    const boundaryItem = scoredItem("SPY", MIN_TICKER_RELEVANCE_SCORE);
+    const result = await loadLiveNewsData({
+      adapterConfig: { fetchImpl: makeMockFetch({ body: feedBody([boundaryItem]) }) },
+    });
+    assert.equal(result.newsData.length, 1);
+  });
+});
+
+// Filtering is never silent: a count reaches warnings (which
+// marketIntelligenceApplicationService.js surfaces as
+// diagnostics.news.warnings) and the additive relevanceFilter field.
+test("107-5. the number of filtered records is reported in warnings and in relevanceFilter", async () => {
+  await withEnvKey(SYNTHETIC_KEY, async () => {
+    const feed = [
+      scoredItem("SPY", 0.9, { title: "SPY closes higher on strong jobs data" }),
+      scoredItem("SPY", 0.03, { title: "Tokenized SPY product listing" }),
+      scoredItem("SPY", 0.01, { title: "Fund holdings history: SPY" }),
+    ];
+    const result = await loadLiveNewsData({
+      adapterConfig: { fetchImpl: makeMockFetch({ body: feedBody(feed) }) },
+    });
+
+    assert.equal(result.newsData.length, 1);
+    assert.equal(result.providerResult.recordCount, 1);
+    assert.equal(result.warnings.length, 1);
+    assert.ok(result.warnings[0].includes("2 of 3"));
+    assert.ok(result.warnings[0].includes(String(MIN_TICKER_RELEVANCE_SCORE)));
+    assert.deepEqual(result.relevanceFilter, {
+      threshold: MIN_TICKER_RELEVANCE_SCORE,
+      examined: 3,
+      filtered: 2,
+      retained: 1,
+    });
+  });
+});
+
+// Anti-fabrication preserved: no score is not the same as a low score.
+// An untagged/unscored record is never dropped by this filter.
+test("107-6. a record carrying no usable relevance_score is never filtered", async () => {
+  await withEnvKey(SYNTHETIC_KEY, async () => {
+    const untagged = sampleItem({ ticker_sentiment: [] });
+    const blankScore = sampleItem({
+      title: "SPY story with a blank provider score",
+      ticker_sentiment: [{ ticker: "SPY", relevance_score: "", ticker_sentiment_score: "0.1", ticker_sentiment_label: "Neutral" }],
+    });
+    const nonNumeric = sampleItem({
+      title: "SPY story with a non-numeric provider score",
+      ticker_sentiment: [{ ticker: "SPY", relevance_score: "n/a", ticker_sentiment_score: "0.1", ticker_sentiment_label: "Neutral" }],
+    });
+    const result = await loadLiveNewsData({
+      adapterConfig: { fetchImpl: makeMockFetch({ body: feedBody([untagged, blankScore, nonNumeric]) }) },
+    });
+    assert.equal(result.newsData.length, 3);
+    assert.deepEqual(result.warnings, []);
+    assert.equal(result.relevanceFilter.filtered, 0);
+  });
+});
+
+// Existing SPY behavior remains valid: the default request shape, the
+// frozen UNKNOWN confidence decision, and the preserved evidence fields
+// all survive the filter.
+test("107-7. existing SPY behavior remains valid — request shape, evidence and impact_confidence unchanged", async () => {
+  await withEnvKey(SYNTHETIC_KEY, async () => {
+    const calls = [];
+    const result = await loadLiveNewsData({
+      adapterConfig: { fetchImpl: makeMockFetch({ body: feedBody([sampleItem()]), onCall: (u) => calls.push(u) }) },
+    });
+    assert.ok(calls[0].includes("function=NEWS_SENTIMENT"));
+    assert.ok(calls[0].includes("tickers=SPY"));
+    assert.ok(calls[0].includes("limit=10"));
+    assert.equal(result.newsData.length, 1);
+    assert.equal(result.newsData[0].impact_confidence, UNKNOWN);
+    assert.equal(result.newsData[0].evidence.alpha_vantage_ticker_sentiment.ticker_sentiment_label, "Somewhat-Bullish");
+  });
+});
+
+// A non-SPY request is filtered on ITS OWN ticker's score, not SPY's.
+test("107-8. a non-SPY request filters on the requested ticker's own relevance_score", async () => {
+  await withEnvKey(SYNTHETIC_KEY, async () => {
+    const item = sampleItem({
+      title: "Broad market note that barely mentions MSFT",
+      ticker_sentiment: [
+        { ticker: "SPY", relevance_score: "0.95", ticker_sentiment_score: "0.3", ticker_sentiment_label: "Somewhat-Bullish" },
+        { ticker: "MSFT", relevance_score: "0.02", ticker_sentiment_score: "0.1", ticker_sentiment_label: "Neutral" },
+      ],
+    });
+    const result = await loadLiveNewsData({
+      symbol: "MSFT",
+      adapterConfig: { fetchImpl: makeMockFetch({ body: feedBody([item]) }) },
+    });
+    // SPY's high score must not rescue an article that is only barely
+    // about the instrument actually requested.
+    assert.deepEqual(result.newsData, []);
+    assert.equal(result.relevanceFilter.filtered, 1);
+  });
+});
+
+// The filter runs AFTER the pre-existing requested-ticker confirmation,
+// so that guard still sees the whole feed and its behavior is unchanged.
+test("107-9. the pre-existing wrong-instrument rejection still fires ahead of the filter", async () => {
+  await withEnvKey(SYNTHETIC_KEY, async () => {
+    const spyOnly = scoredItem("SPY", 0.9);
+    const result = await loadLiveNewsData({
+      symbol: "BTC",
+      adapterConfig: { fetchImpl: makeMockFetch({ body: feedBody([spyOnly]) }) },
+    });
+    assert.deepEqual(result.newsData, []);
+    assert.equal(result.providerResult.ok, false);
+    assert.equal(result.providerResult.code, "INVALID_RESPONSE");
+  });
+});

@@ -36,6 +36,50 @@ const { symbolsMatch } = require("./instrumentContext");
 const DEFAULT_NEWS_TICKERS = "SPY";
 const NEWS_LIMIT = 10;
 
+// --- Step 107: provider-scored relevance filter ---
+//
+// Alpha Vantage tags an article with a ticker whenever that ticker is
+// mentioned at all. In production this returned, for a SPY request,
+// tokenized-SPY product listings, currency-conversion pages,
+// fund-holdings-history pages and unrelated SPY derivatives — every one
+// of them tagged "SPY", and therefore every one of them scored DIRECT
+// relevance by agents/news-agent/relevance.js, whose only test is
+// whether related_assets names the requested asset.
+//
+// The provider already publishes its own answer to "how much is this
+// article actually about this ticker": ticker_sentiment[].relevance_score,
+// a 0.0-1.0 value the adapter already preserves verbatim at
+// evidence.alpha_vantage_ticker_sentiment.relevance_score. Until now
+// nothing read it back. This filter reads it — and nothing else. No
+// keyword list, no headline-text rule, no NLP judgment is introduced
+// here; that would be exactly the kind of invented rule this project
+// refuses to make (see agents/news-agent/duplicates.js's own reasoning).
+//
+// THRESHOLD: deliberately at the conservative (low) end. 0.1 removes
+// only the clearly-irrelevant tail — a passing mention — and leaves
+// every borderline article in, because wrongly discarding a real story
+// is worse here than passing one extra weak one downstream. Raise it
+// only with evidence from observed filtered counts.
+//
+// A record with NO usable relevance_score is never filtered. Absence of
+// provider tagging is not evidence of irrelevance, the same rule the
+// requested-ticker confirmation below already follows.
+const MIN_TICKER_RELEVANCE_SCORE = 0.1;
+
+// Returns the provider's numeric relevance score for a mapped record, or
+// null when the record carries no usable score. Never coerces a missing,
+// blank or non-numeric value into 0 — that would silently turn "unknown"
+// into "irrelevant" and drop the record.
+function readTickerRelevanceScore(record) {
+  const sentiment = record && record.evidence && record.evidence.alpha_vantage_ticker_sentiment;
+  if (!sentiment || typeof sentiment !== "object") return null;
+  const raw = sentiment.relevance_score;
+  if (typeof raw === "number") return Number.isFinite(raw) ? raw : null;
+  if (typeof raw !== "string" || raw.trim() === "") return null;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 // options.symbol: the resolved instrument symbol to request (e.g. from
 //   providers/instrumentContext.js's resolveInstrumentContext()) —
 //   defaults to DEFAULT_NEWS_TICKERS only when omitted, never guessed
@@ -93,11 +137,48 @@ async function loadLiveNewsData(options = {}) {
     };
   }
 
+  // Step 107: provider-scored relevance filter, applied AFTER the
+  // requested-ticker confirmation above so that check still sees the
+  // whole feed exactly as before, and BEFORE anything downstream sees a
+  // record. Nothing is rewritten, rescored or merged — a record is
+  // either passed through byte-for-byte or excluded and counted.
+  const retained = [];
+  let filteredCount = 0;
+  for (const record of records) {
+    const score = readTickerRelevanceScore(record);
+    if (score !== null && score < MIN_TICKER_RELEVANCE_SCORE) {
+      filteredCount += 1;
+      continue;
+    }
+    retained.push(record);
+  }
+
+  // Never silent: an excluded record is always reported as a count in
+  // warnings (which marketIntelligenceApplicationService.js already
+  // surfaces as diagnostics.news.warnings) and in the additive
+  // relevanceFilter field below. Headlines are deliberately not listed —
+  // the count is the operational fact; the full feed is one provider
+  // call away if an operator needs to inspect it.
+  const warnings =
+    filteredCount > 0
+      ? [
+          `Alpha Vantage news relevance filter: ${filteredCount} of ${records.length} record(s) excluded for "${tickers}" — provider ticker relevance_score below ${MIN_TICKER_RELEVANCE_SCORE}.`,
+        ]
+      : [];
+
   return {
-    newsData: records,
-    providerResult: { ok: true, recordCount: records.length },
-    warnings: [],
+    newsData: retained,
+    providerResult: { ok: true, recordCount: retained.length },
+    warnings,
+    // Additive diagnostic field — no existing caller reads it, and every
+    // pre-existing field above keeps its exact shape.
+    relevanceFilter: {
+      threshold: MIN_TICKER_RELEVANCE_SCORE,
+      examined: records.length,
+      filtered: filteredCount,
+      retained: retained.length,
+    },
   };
 }
 
-module.exports = { loadLiveNewsData };
+module.exports = { loadLiveNewsData, MIN_TICKER_RELEVANCE_SCORE, readTickerRelevanceScore };
