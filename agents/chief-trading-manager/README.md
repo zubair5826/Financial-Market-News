@@ -15,11 +15,17 @@ RECEIVE 6 reports -> VALIDATE each (never bypassed) -> per-domain
 ## Status
 
 **IMPLEMENTED**: everything described below, driven entirely by the
-six reports supplied to it. **NOT IMPLEMENTED**: any orchestration
-wiring that automatically runs the other 7 agents and threads their
-output into this one — the caller must assemble `inputs` manually for
-now. **FUTURE**: that end-to-end wiring, once `orchestrator/` is built
-out; this step explicitly does not proceed to that integration work.
+six reports supplied to it. Orchestrator wiring is also implemented:
+`orchestrator/index.js` (`processRequest()`) runs the full 8-agent
+deterministic pipeline end-to-end (Data Controller -> News/Macro/
+Technical/Sentiment -> Trade Setup -> Risk Manager -> Chief Trading
+Manager). Its `sendToChiefManager()` step hands this agent the Trade
+Setup report, the Risk Manager report, and the collected specialist
+reports as `inputs` (a specialist that failed or wasn't run arrives as
+`null` and is treated as not supplied), and this agent's report is
+returned as the pipeline's `response`. **NOT IMPLEMENTED**: any broker,
+exchange, or order execution — no such code path exists in this agent
+or in the orchestrator.
 
 ## Responsibilities
 
@@ -206,8 +212,10 @@ before relying on this.
   especially the three fixes above).
 - Final-assessment/confidence thresholds are this project's own
   documented heuristic, not a validated decision-making methodology.
-- No orchestrator wiring — the caller must assemble all 6 reports
-  manually; this step explicitly stops before that integration.
+- Orchestrator wiring is in place (`orchestrator/index.js` assembles
+  all 6 reports automatically), but a direct call to
+  `processChiefDecision()` outside the orchestrator still needs the
+  caller to assemble `inputs` manually.
 - `key_assumptions` is a fixed, short, methodological list — it does
   not dynamically enumerate every judgment call made per request
   beyond noting validation failures.

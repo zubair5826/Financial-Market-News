@@ -19,10 +19,17 @@ RECEIVE Trade Setup report (+ optional News/Macro/Technical/Sentiment
 Setup Agent's report and, optionally, the raw News/Macro/Technical/
 Sentiment reports for finer-grained risk detail (volatility, volume,
 upcoming events) that isn't captured in the Trade Setup Agent's
-summarized evidence. **NOT IMPLEMENTED**: the Chief Trading Manager
-(next step), any orchestration wiring that automatically threads a
-real trade setup and its four source reports into this agent.
-**FUTURE**: that wiring, once `orchestrator/` is built out.
+summarized evidence. Orchestrator wiring is also implemented:
+`orchestrator/index.js` (`processRequest()`) runs the full 8-agent
+deterministic pipeline end-to-end (Data Controller -> News/Macro/
+Technical/Sentiment -> Trade Setup -> Risk Manager -> Chief Trading
+Manager). Its `sendToRiskManager()` step hands this agent the Trade
+Setup Agent's report plus the four specialist reports as `inputs`
+(a specialist that failed or wasn't run arrives as `null` and is
+treated as not supplied), and this agent's Risk Report is then passed
+on to the Chief Trading Manager. **NOT IMPLEMENTED**: any broker,
+exchange, or order execution — no such code path exists in this agent
+or in the orchestrator.
 
 ## Responsibilities
 
@@ -211,9 +218,13 @@ before relying on this.
 - Untested by execution (highest priority to verify on your end).
 - Risk-level/decision thresholds are this project's own documented
   heuristic, not a validated risk-management methodology.
-- No orchestrator wiring — the caller must assemble `inputs` (and any
-  `positionSizingParams`) manually for now.
+- `orchestrator/index.js` assembles `inputs` automatically, but
+  `positionSizingParams` and `upcomingEventWindowMs` are never invented
+  by it — they still have to come from the caller (via the request's
+  `options`), or position sizing and event timing stay
+  `DATA_UNAVAILABLE`/`UNKNOWN`.
 - `VOLATILITY_RISK`/`LIQUIDITY_RISK`/timing-event detection all
-  require the caller to separately supply the relevant raw domain
-  report — the Trade Setup Agent's embedded evidence objects don't
-  carry that level of detail.
+  require the relevant raw domain report to be supplied (the
+  orchestrator passes all four through; a direct caller must supply
+  them separately) — the Trade Setup Agent's embedded evidence objects
+  don't carry that level of detail.
