@@ -176,7 +176,7 @@ async function runMarketIntelligenceRequest(request, options = {}) {
   // request object is never mutated. Only enabled domains' keys are
   // set; a disabled domain's own caller-supplied payload (if any)
   // passes through untouched via the spread.
-  const mergedRequest = { ...request };
+  const mergedRequest = { ...request, options: { ...(request.options || {}), ...options } };
   if (macroEnabled) mergedRequest.macroData = macroResult.macroData;
   if (marketEnabled) mergedRequest.technicalCandles = marketResult.technicalCandles;
   if (newsEnabled) mergedRequest.newsData = newsResult.newsData;
