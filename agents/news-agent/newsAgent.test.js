@@ -249,3 +249,32 @@ test("D. existing behavior for a single relevant (DIRECT) item is completely unc
   assert.equal(result.validated_items[0].relevance, "DIRECT");
   assert.equal(result.conflicts.length, 0);
 });
+
+// E. Regression: Alpha Vantage's raw, separator-less time_published
+// format ("20260824T093000") previously made computeFreshness()
+// report UNKNOWN for every live news record — Date.parse() can't read
+// that shape — even though freshnessThresholds was correctly supplied.
+// The News Agent now normalizes that one recognized compact pattern
+// into a real ISO-8601 timestamp before computing freshness, so a
+// stale live-fetched headline is honestly reported STALE (not a
+// misleading "no freshness thresholds were configured" UNKNOWN).
+test("E. a raw Alpha-Vantage-format publication_timestamp is normalized so freshness is honestly computed, not UNKNOWN", () => {
+  const item = baseItem({ publication_timestamp: "20200101T093000" }); // long past agingMaxMs
+  const result = processNews([item], { freshnessThresholds: THRESHOLDS });
+  assert.equal(result.validated_items.length, 1);
+  assert.equal(result.validated_items[0].freshness_status, "STALE");
+  assert.ok(
+    !result.warnings.some((w) => typeof w === "string" && w.includes("no freshness thresholds were configured")),
+    "freshness must never be misreported as UNKNOWN due to thresholds when a valid threshold was supplied"
+  );
+});
+
+// F. An already-ISO publication_timestamp (every existing caller,
+// including every other test in this file) must pass through this
+// normalization completely untouched.
+test("F. an already-ISO-8601 publication_timestamp is left exactly as supplied", () => {
+  const iso = new Date(Date.now() - 5000).toISOString();
+  const item = baseItem({ publication_timestamp: iso });
+  const result = processNews([item], { freshnessThresholds: THRESHOLDS });
+  assert.equal(result.validated_items[0].publication_timestamp, iso);
+});
