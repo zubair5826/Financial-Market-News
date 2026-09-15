@@ -676,6 +676,7 @@ test("99-1a. a BTC news record's Alpha Vantage ticker sentiment is bridged into 
     assert.equal(record.sentiment, "BULLISH");
     assert.equal(record.sentiment_score, 0.4);
     assert.equal(record.source_type, "NEWS");
+    assert.equal(record.timestamp, "2026-08-24T09:30:00Z");
   });
 });
 

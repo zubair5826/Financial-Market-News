@@ -25,6 +25,7 @@ const { resolveInstrumentContext, UNKNOWN: INSTRUMENT_UNKNOWN } = require("./ins
 const { getFreshnessThresholds, getFreshnessThresholdsByPipelineDomain } = require("../config/freshness");
 const { ALPHA_VANTAGE_INTER_REQUEST_DELAY_MS, delay } = require("./alphaVantageRateLimit");
 const { createSentimentRecord, SENTIMENT_VALUES, SOURCE_TYPES } = require("../agents/sentiment-agent/sentimentRecord");
+const { normalizeNewsItem } = require("../agents/news-agent/normalize");
 
 const DEFAULT_MACRO_SERIES_IDS = ["GNPCA"];
 
@@ -60,15 +61,17 @@ function buildSentimentDataFromNews(newsData = [], requestedSymbol) {
       const numericScore = Number(providerSentiment.ticker_sentiment_score);
       const sentimentScore = Number.isFinite(numericScore) ? numericScore : "UNKNOWN";
 
+      const normalizedNews = normalizeNewsItem(news);
+
       return createSentimentRecord({
         asset: ticker,
-        timestamp: news.publication_timestamp,
-        source: news.source,
+        timestamp: normalizedNews.publication_timestamp,
+        source: normalizedNews.source,
         source_type: SOURCE_TYPES.NEWS,
-        content_reference: news.url_or_reference,
+        content_reference: normalizedNews.url_or_reference,
         sentiment,
         sentiment_score: sentimentScore,
-        classification: news.classification,
+        classification: normalizedNews.classification,
         evidence: {
           alpha_vantage_ticker_sentiment: providerSentiment,
         },
