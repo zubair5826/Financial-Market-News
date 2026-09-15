@@ -24,8 +24,58 @@ const { failSafe, ERROR_CODES } = require("../core/errors");
 const { resolveInstrumentContext, UNKNOWN: INSTRUMENT_UNKNOWN } = require("./instrumentContext");
 const { getFreshnessThresholds, getFreshnessThresholdsByPipelineDomain } = require("../config/freshness");
 const { ALPHA_VANTAGE_INTER_REQUEST_DELAY_MS, delay } = require("./alphaVantageRateLimit");
+const { createSentimentRecord, SENTIMENT_VALUES, SOURCE_TYPES } = require("../agents/sentiment-agent/sentimentRecord");
 
 const DEFAULT_MACRO_SERIES_IDS = ["GNPCA"];
+
+function buildSentimentDataFromNews(newsData = [], requestedSymbol) {
+  if (!Array.isArray(newsData) || newsData.length === 0 || !requestedSymbol) return [];
+
+  return newsData
+    .map((news) => {
+      const providerSentiment = news?.evidence?.alpha_vantage_ticker_sentiment;
+      if (!providerSentiment || typeof providerSentiment !== "object") return null;
+
+      const ticker = typeof providerSentiment.ticker === "string"
+        ? providerSentiment.ticker.trim()
+        : "";
+
+      if (!ticker || ticker.toUpperCase() !== String(requestedSymbol).trim().toUpperCase()) {
+        return null;
+      }
+
+      const label = typeof providerSentiment.ticker_sentiment_label === "string"
+        ? providerSentiment.ticker_sentiment_label
+        : "";
+
+      const sentiment =
+        label === "Bullish" || label === "Somewhat-Bullish"
+          ? SENTIMENT_VALUES.BULLISH
+          : label === "Neutral"
+            ? SENTIMENT_VALUES.NEUTRAL
+            : label === "Bearish" || label === "Somewhat-Bearish"
+              ? SENTIMENT_VALUES.BEARISH
+              : SENTIMENT_VALUES.UNKNOWN;
+
+      const numericScore = Number(providerSentiment.ticker_sentiment_score);
+      const sentimentScore = Number.isFinite(numericScore) ? numericScore : "UNKNOWN";
+
+      return createSentimentRecord({
+        asset: ticker,
+        timestamp: news.publication_timestamp,
+        source: news.source,
+        source_type: SOURCE_TYPES.NEWS,
+        content_reference: news.url_or_reference,
+        sentiment,
+        sentiment_score: sentimentScore,
+        classification: news.classification,
+        evidence: {
+          alpha_vantage_ticker_sentiment: providerSentiment,
+        },
+      });
+    })
+    .filter(Boolean);
+}
 
 // Step 48 discovered, live, that Alpha Vantage's free-tier key enforces
 // a real "1 request per second" burst limit — launching the market and
@@ -131,6 +181,9 @@ async function runMarketIntelligenceRequest(request, options = {}) {
   if (newsEnabled && Array.isArray(request.newsData) && request.newsData.length > 0) {
     return { pipelineResult: rejectAmbiguousMerge("request.newsData"), diagnostics: null };
   }
+  if (newsEnabled && Array.isArray(request.sentimentData) && request.sentimentData.length > 0) {
+    return { pipelineResult: rejectAmbiguousMerge("request.sentimentData"), diagnostics: null };
+  }
 
   if (!macroEnabled && !marketEnabled && !newsEnabled) {
     // No domain enabled: identical to calling processRequest() directly
@@ -180,6 +233,12 @@ async function runMarketIntelligenceRequest(request, options = {}) {
   if (macroEnabled) mergedRequest.macroData = macroResult.macroData;
   if (marketEnabled) mergedRequest.technicalCandles = marketResult.technicalCandles;
   if (newsEnabled) mergedRequest.newsData = newsResult.newsData;
+  if (newsEnabled) {
+    mergedRequest.sentimentData = buildSentimentDataFromNews(
+      newsResult.newsData,
+      instrumentContext.normalizedSymbol
+    );
+  }
 
   // Exactly ONE processRequest() call for the whole composed run —
   // never one per provider (Step 46A hard invariant).

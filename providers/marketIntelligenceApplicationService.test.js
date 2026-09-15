@@ -19,8 +19,10 @@ const assert = require("node:assert/strict");
 const orchestratorModule = require("../orchestrator");
 const originalProcessRequest = orchestratorModule.processRequest;
 let processRequestCallCount = 0;
+let lastProcessRequestInput = null;
 orchestratorModule.processRequest = (...args) => {
   processRequestCallCount++;
+  lastProcessRequestInput = args[0];
   return originalProcessRequest(...args);
 };
 
@@ -643,6 +645,56 @@ test("99-1. a BTC request resolves the instrument context and requests BTC (not 
     assert.equal(result.diagnostics.instrument.normalizedSymbol, "BTC");
     assert.equal(result.pipelineResult.pipeline_summary.technical_status, "OK");
     assert.equal(result.pipelineResult.pipeline_summary.news_status, "OK");
+  });
+});
+
+// Sentiment bridge: Alpha Vantage ticker sentiment already carried on
+// the BTC news record reaches the existing Sentiment Agent as one
+// sentiment record — no extra provider call, no fabricated record.
+test("99-1a. a BTC news record's Alpha Vantage ticker sentiment is bridged into request.sentimentData and the Sentiment Agent reports OK", async () => {
+  await withEnvKeys({ fred: SYNTHETIC_FRED_KEY, av: SYNTHETIC_AV_KEY }, async () => {
+    processRequestCallCount = 0;
+    lastProcessRequestInput = null;
+    const marketCalls = [];
+    const newsCalls = [];
+    const result = await runMarketIntelligenceRequest(validBaseRequest({ query: "Assess BTC", asset: "BTC" }), {
+      market: { enabled: true },
+      news: { enabled: true },
+      marketAdapterConfig: { fetchImpl: async (url) => { marketCalls.push(url); return jsonResponse(200, btcMarketBody()); } },
+      newsAdapterConfig: { fetchImpl: async (url) => { newsCalls.push(url); return jsonResponse(200, btcNewsBody()); } },
+    });
+    assert.equal(marketCalls.length, 1);
+    assert.equal(newsCalls.length, 1);
+    assert.equal(processRequestCallCount, 1);
+    assert.equal(result.pipelineResult.pipeline_summary.sentiment_status, "OK");
+
+    const sentimentData = lastProcessRequestInput.sentimentData;
+    assert.ok(Array.isArray(sentimentData));
+    assert.equal(sentimentData.length, 1);
+    const [record] = sentimentData;
+    assert.equal(record.asset, "BTC");
+    assert.equal(record.sentiment, "BULLISH");
+    assert.equal(record.sentiment_score, 0.4);
+    assert.equal(record.source_type, "NEWS");
+  });
+});
+
+// Sentiment ambiguity guard: caller-supplied sentimentData while news
+// is enabled is rejected before any network access or pipeline run.
+test("99-1b. news enabled + request.sentimentData already present: clear rejection, no news call, no processRequest() call", async () => {
+  await withEnvKeys({ av: SYNTHETIC_AV_KEY }, async () => {
+    processRequestCallCount = 0;
+    const { newsCalls, adapterConfigs } = allProviderCalls();
+    const request = validBaseRequest({ sentimentData: [{ asset: "SPY", sentiment: "BULLISH", source_type: "NEWS" }] });
+    const { value: result, networkCalled } = await withNetworkGuard(async () =>
+      runMarketIntelligenceRequest(request, { news: { enabled: true }, ...adapterConfigs })
+    );
+    assert.equal(networkCalled, false);
+    assert.equal(newsCalls.length, 0);
+    assert.equal(processRequestCallCount, 0);
+    assert.equal(result.pipelineResult.ok, false);
+    assert.equal(result.pipelineResult.code, ERROR_CODES.MALFORMED_DATA);
+    assert.ok(result.pipelineResult.message.includes("request.sentimentData"));
   });
 });
 
