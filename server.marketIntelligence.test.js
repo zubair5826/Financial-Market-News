@@ -23,18 +23,26 @@ const TEST_AUTH_TOKEN = "SYNTHETIC_TEST_AUTH_TOKEN_MARKET_INTEL";
 const AUTH_HEADERS = Object.freeze({ Authorization: `Bearer ${TEST_AUTH_TOKEN}` });
 const JSON_AUTH_HEADERS = Object.freeze({ "Content-Type": "application/json", Authorization: `Bearer ${TEST_AUTH_TOKEN}` });
 
-// This file's only two real POST /api/intelligence calls (tests 4b and
-// 8b) must never write to the real data/runs.jsonl — mirrors
-// server.test.js's own TEST_RUNS_FILE/RUN_STORE_OPTIONS pattern
-// exactly. /api/market-intelligence itself has no persistence at all
-// (runMarketIntelligenceRequest() never calls persistRun()), so this
-// override is only ever needed on the /api/intelligence calls.
+// No test in this file may ever write to the real data/runs.jsonl —
+// mirrors server.test.js's own TEST_RUNS_FILE/RUN_STORE_OPTIONS
+// pattern exactly.
+//
+// UPDATED: /api/market-intelligence now persists every run (it moved
+// onto the unified runAgentRequest() composition), so the override can
+// no longer be applied per-call to just the /api/intelligence tests.
+// Setting RUN_STORE_FILE for the whole file makes server.js's own
+// getRunStoreOptions() redirect BOTH endpoints, for every test here,
+// including the ones that send no body at all and therefore have
+// nowhere to carry options.runStore. A body-supplied options.runStore
+// still wins, so the existing RUN_STORE_OPTIONS calls are unchanged.
 const TEST_RUNS_FILE = path.join(os.tmpdir(), `server-market-intel-test-runs-${Date.now()}-${Math.random().toString(36).slice(2)}.jsonl`);
 const RUN_STORE_OPTIONS = { runStore: { filePath: TEST_RUNS_FILE } };
 
 process.env.API_AUTH_TOKEN = TEST_AUTH_TOKEN;
+process.env.RUN_STORE_FILE = TEST_RUNS_FILE;
 test.after(() => {
   delete process.env.API_AUTH_TOKEN;
+  delete process.env.RUN_STORE_FILE;
   try {
     fs.unlinkSync(TEST_RUNS_FILE);
   } catch {
@@ -291,7 +299,17 @@ test("6e. an empty body still returns 200 (defaults to {} request/options, same 
 
 // --- 7. Response shape ---
 
-test("7. the response is exactly { pipelineResult, diagnostics } — nothing more, nothing from a different code path", async () => {
+// UPDATED when this endpoint moved onto the unified runAgentRequest()
+// composition. It previously called runMarketIntelligenceRequest()
+// directly, which has no persistence and no LLM concept, so the
+// response carried exactly two keys. The endpoint now persists every
+// run (the whole point of unifying it — the one route that gathers
+// live cross-domain evidence used to leave no audit trail), so
+// `persistence` and `llmAnnotation` are present as ADDITIVE fields,
+// the same precedent /api/intelligence already set. The original
+// intent of this test is preserved exactly: the response must contain
+// these fields and NOTHING from a different code path.
+test("7. the response is exactly { pipelineResult, diagnostics, persistence, llmAnnotation } — nothing more, nothing from a different code path", async () => {
   await withRunningServer(async ({ baseUrl }) => {
     const res = await fetch(`${baseUrl}/api/market-intelligence`, {
       method: "POST",
@@ -299,11 +317,35 @@ test("7. the response is exactly { pipelineResult, diagnostics } — nothing mor
       body: JSON.stringify({ request: { query: "Assess SPY", asset: "SPY" } }),
     });
     const body = await res.json();
-    assert.deepEqual(Object.keys(body).sort(), ["diagnostics", "pipelineResult"]);
-    // No persistence and no llmAnnotation — runMarketIntelligenceRequest()
-    // has neither concept, so none should appear here.
-    assert.equal(Object.prototype.hasOwnProperty.call(body, "persistence"), false);
-    assert.equal(Object.prototype.hasOwnProperty.call(body, "llmAnnotation"), false);
+    assert.deepEqual(Object.keys(body).sort(), ["diagnostics", "llmAnnotation", "persistence", "pipelineResult"]);
+    // pipelineResult/diagnostics keep their exact previous meaning —
+    // runAgentRequest() returns both verbatim from the same unmodified
+    // runMarketIntelligenceRequest() this endpoint always called.
+    assert.equal(body.pipelineResult.ok, true);
+    assert.equal(body.diagnostics, null);
+    // The Claude layer is opt-in: not requested here, so null.
+    assert.equal(body.llmAnnotation, null);
+    // Persistence is now real on this route.
+    assert.equal(body.persistence.status, "PERSISTED");
+    assert.equal(typeof body.persistence.run_id, "string");
+  });
+});
+
+test("7a. every live multi-domain run through this endpoint is now persisted (the unified-path regression)", async () => {
+  await withRunningServer(async ({ baseUrl }) => {
+    const res = await fetch(`${baseUrl}/api/market-intelligence`, {
+      method: "POST",
+      headers: JSON_AUTH_HEADERS,
+      body: JSON.stringify({ request: { query: "Assess SPY", asset: "SPY" }, options: RUN_STORE_OPTIONS }),
+    });
+    const body = await res.json();
+    assert.equal(res.status, 200);
+    assert.equal(body.persistence.status, "PERSISTED");
+
+    const lines = fs.readFileSync(TEST_RUNS_FILE, "utf8").trim().split("\n").filter(Boolean);
+    const record = JSON.parse(lines[lines.length - 1]);
+    assert.equal(record.run_id, body.persistence.run_id);
+    assert.equal(record.requested_instrument, "SPY");
   });
 });
 

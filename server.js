@@ -17,9 +17,18 @@
 // Calls exactly three existing, unmodified functions:
 //   - runApplicationRequest(request, options)  from ./app.js
 //   - runPortfolioIntelligenceRequest(request) from ./portfolioIntelligence.js
-//   - runMarketIntelligenceRequest(request, options)
-//       from ./providers/marketIntelligenceApplicationService.js
+//   - runAgentRequest(request, options)        from ./agentRequest.js
 // None is reimplemented, extended, or bypassed here.
+//
+// /api/market-intelligence previously called
+// runMarketIntelligenceRequest() directly and therefore persisted
+// nothing — the one endpoint that actually gathers cross-domain live
+// evidence left no audit trail. It now calls runAgentRequest(), which
+// composes that same unmodified function with the existing run store
+// and the existing optional Claude layer, so every live multi-domain
+// run is recorded consistently with /api/intelligence. No new endpoint
+// was added; provider domains remain disabled unless the caller
+// enables them, exactly as before.
 //
 // Step 105 — security design:
 //   - Authentication: a single shared secret, API_AUTH_TOKEN, read
@@ -68,7 +77,7 @@ const http = require("http");
 const crypto = require("crypto");
 const { runApplicationRequest } = require("./app");
 const { runPortfolioIntelligenceRequest } = require("./portfolioIntelligence");
-const { runMarketIntelligenceRequest } = require("./providers/marketIntelligenceApplicationService");
+const { runAgentRequest } = require("./agentRequest");
 const { logEvent } = require("./logs/logger");
 
 const PORT = process.env.PORT || 3000;
@@ -385,14 +394,18 @@ async function handlePortfolioIntelligence(req, res) {
 }
 
 // POST /api/market-intelligence — body: { request?: object, options?: object }.
-// Calls the existing, unmodified runMarketIntelligenceRequest() and
-// returns its existing { pipelineResult, diagnostics } shape verbatim.
+// Calls the unified runAgentRequest() (agentRequest.js), which itself
+// calls the existing, unmodified runMarketIntelligenceRequest() and
+// returns its { pipelineResult, diagnostics } verbatim, plus the two
+// additive fields `persistence` and `llmAnnotation` — the same
+// additive-field precedent /api/intelligence already set.
 // Every provider domain (macro/market/news) is only ever touched if the
 // caller's own options.{macro,market,news}.enabled === true — identical
-// disabled-by-default rule as /api/intelligence's options.macro.enabled.
-// This endpoint has no persistence and no LLM annotation — it reuses
-// runMarketIntelligenceRequest() exactly as runLive.js already does,
-// and that function does neither of those things today.
+// disabled-by-default rule as /api/intelligence's options.macro.enabled,
+// and runAgentRequest() enables nothing on its own.
+// The Claude layer likewise stays off unless the caller's own
+// options.llm.enabled === true, and is advisory-only: it cannot affect
+// risk_decision, decision_status, or final_assessment.
 async function handleMarketIntelligence(req, res) {
   if (req.method !== "POST") {
     return sendJson(res, 405, { error: "Method Not Allowed", allowed: ["POST"] });
@@ -419,7 +432,12 @@ async function handleMarketIntelligence(req, res) {
     return sendJson(res, 400, { error: "\"request\" and \"options\", if present, must be JSON objects." });
   }
 
-  const result = await runMarketIntelligenceRequest(requestArg, optionsArg);
+  // Step 106's RUN_STORE_FILE default now applies to this endpoint too,
+  // for the same reason it applies to /api/intelligence: this route
+  // persists a run record, so it must honor the operator's configured
+  // store path (and must not append to the real store during tests).
+  // An explicit body-supplied options.runStore still wins.
+  const result = await runAgentRequest(requestArg, { ...getRunStoreOptions(), ...optionsArg });
   return sendJson(res, 200, result);
 }
 

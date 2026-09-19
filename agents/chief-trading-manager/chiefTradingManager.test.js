@@ -324,3 +324,98 @@ test("key_assumptions are methodological only — never a claim about market out
   assert.ok(report.key_assumptions.length > 0);
   assert.ok(!report.key_assumptions.some((a) => /will rise|will fall|guaranteed/i.test(a)));
 });
+
+// --- data_quality passthrough regression -------------------------
+//
+// buildRiskSummary() previously dropped the Risk Report's
+// data_quality object. Three downstream readers
+// (data/runStore.js, llm/evidencePackage.js, and the user-facing
+// report itself) all look for `risk_summary.data_quality` and all
+// three therefore always saw nothing — every persisted run recorded
+// freshness_status/data_quality_status as "UNKNOWN" regardless of
+// what the pipeline had actually determined. These tests pin the
+// passthrough so it cannot silently regress again.
+
+function riskReportWithDataQuality(overrides = {}) {
+  return riskReport({
+    data_quality: {
+      stale: true,
+      unverified: true,
+      conflicting: false,
+      missing_information: ["sentiment"],
+      technical_timeframe_conflict: false,
+      upcoming_events_near: "UNKNOWN",
+      weak_setup_evidence: false,
+      freshnessStatus: "STALE",
+      staleCount: 2,
+      unverifiedCount: 1,
+      missingCount: 1,
+      qualityStatus: "LOW",
+      ...overrides,
+    },
+  });
+}
+
+test("data_quality: the Risk Report's data_quality reaches risk_summary verbatim", () => {
+  const inputs = allBullishInputs();
+  const supplied = riskReportWithDataQuality();
+  inputs.riskReport = supplied;
+
+  const { report } = runChiefTradingManager(inputs);
+  assert.deepEqual(report.risk_summary.data_quality, supplied.data_quality);
+  // The two fields every downstream consumer actually reads.
+  assert.equal(report.risk_summary.data_quality.freshnessStatus, "STALE");
+  assert.equal(report.risk_summary.data_quality.qualityStatus, "LOW");
+});
+
+test("data_quality: a Risk Report carrying none yields null — never a guessed or invented value", () => {
+  const { report } = runChiefTradingManager(allBullishInputs());
+  assert.equal(report.risk_summary.data_quality, null);
+});
+
+test("data_quality: no risk report at all leaves risk_summary null, unchanged from before", () => {
+  const inputs = allBullishInputs();
+  delete inputs.riskReport;
+  const { report } = runChiefTradingManager(inputs);
+  assert.equal(report.risk_summary, null);
+});
+
+test("data_quality: adding the field changes no decision value (reporting-only fix)", () => {
+  const withoutDq = runChiefTradingManager(allBullishInputs()).report;
+  const inputs = allBullishInputs();
+  inputs.riskReport = riskReportWithDataQuality();
+  const withDq = runChiefTradingManager(inputs).report;
+
+  assert.equal(withDq.final_assessment, withoutDq.final_assessment);
+  assert.equal(withDq.decision_status, withoutDq.decision_status);
+  assert.equal(withDq.confidence, withoutDq.confidence);
+  assert.equal(withDq.risk_summary.risk_decision, withoutDq.risk_summary.risk_decision);
+  assert.equal(withDq.risk_summary.risk_level, withoutDq.risk_summary.risk_level);
+});
+
+test("data_quality: every other risk_summary field is untouched by the addition", () => {
+  const inputs = allBullishInputs();
+  inputs.riskReport = riskReportWithDataQuality();
+  const { report } = runChiefTradingManager(inputs);
+  const summary = report.risk_summary;
+
+  assert.equal(summary.domain, "RISK");
+  assert.equal(summary.risk_level, "LOW");
+  assert.equal(summary.risk_decision, "RISK_ACCEPTABLE");
+  assert.deepEqual(summary.risk_categories, []);
+  assert.deepEqual(summary.sources, ["risk-A"]);
+  assert.deepEqual(Object.keys(summary).sort(), [
+    "confidence",
+    "data_quality",
+    "domain",
+    "invalidation_assessment",
+    "position_size_status",
+    "risk_categories",
+    "risk_decision",
+    "risk_level",
+    "sources",
+    "timestamp",
+    "uncertainties",
+    "warnings",
+  ]);
+});

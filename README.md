@@ -449,17 +449,27 @@ Limitations.
 
 `POST /api/market-intelligence` uses the same
 `Authorization: Bearer $API_AUTH_TOKEN` check as the other protected
-routes and calls the existing, unmodified
-`runMarketIntelligenceRequest()`
+routes and calls the unified `runAgentRequest()`
+([agentRequest.js](agentRequest.js)), which itself calls the existing,
+unmodified `runMarketIntelligenceRequest()`
 ([providers/marketIntelligenceApplicationService.js](providers/marketIntelligenceApplicationService.js))
 — the same live-data composition `runLive.js` already exercises from
-the command line, now reachable over HTTP. Each provider domain
-(`macro`/`market`/`news`) is only touched when the caller's own
-`options.<domain>.enabled === true`, identical to
-`/api/intelligence`'s `options.macro.enabled` rule. It returns that
-function's existing `{ pipelineResult, diagnostics }` shape verbatim —
-no new response contract, no persistence, and no LLM annotation (this
-entrypoint has neither).
+the command line. Each provider domain (`macro`/`market`/`news`) is
+only touched when the caller's own `options.<domain>.enabled === true`,
+identical to `/api/intelligence`'s `options.macro.enabled` rule, and
+`runAgentRequest()` enables none of them on its own.
+
+It returns `{ pipelineResult, diagnostics }` verbatim from that
+function, plus two additive fields: `persistence` and `llmAnnotation`.
+Persistence is the change — this route previously recorded nothing, so
+the one endpoint that actually gathers live cross-domain evidence left
+no audit trail while `/api/intelligence` (macro only) had one. Every
+run through either route is now appended to the run store
+([data/runStore.js](data/runStore.js)), honoring `RUN_STORE_FILE` and a
+body-supplied `options.runStore` exactly as `/api/intelligence` already
+did. The Claude layer stays off unless the caller sets
+`options.llm.enabled === true`, and is advisory-only: it cannot affect
+`risk_decision`, `decision_status`, or `final_assessment`.
 
 Security properties, each covered by tests in
 [server.test.js](server.test.js): the bearer comparison is
@@ -577,11 +587,16 @@ see [Fail-Safe Guarantees](#fail-safe-guarantees)).
   the Data Controller's own domain remain `UNKNOWN` — not selected,
   not assumed.
 - **An HTTP API and CLI runners exist** ([server.js](server.js),
-  [runIntelligence.js](runIntelligence.js), [runLive.js](runLive.js),
+  [runAgent.js](runAgent.js), [runIntelligence.js](runIntelligence.js),
+  [runLive.js](runLive.js),
   [runPortfolioIntelligence.js](runPortfolioIntelligence.js)) — see
   [HTTP API](#http-api-serverjs). The API requires a bearer token, is
   rate-limited per client IP, and binds to loopback unless `HOST` says
-  otherwise.
+  otherwise. `runAgent.js` is the general-purpose one: it takes any
+  symbol, enables all three live domains by default, and prints a
+  readable report (`--format=json` for the raw structure).
+  `runIntelligence.js` (macro only) and `runLive.js` (SPY only) are
+  unchanged and still work exactly as before.
 - **Run records are persisted** to `data/runs.jsonl` (one JSONL line
   per completed run, credentials redacted — [data/runStore.js](data/runStore.js)).
   What is NOT recorded is the market OUTCOME of a run: nothing in this

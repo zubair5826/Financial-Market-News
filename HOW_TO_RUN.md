@@ -28,6 +28,40 @@ It writes no file; redirect it if you want to keep a run:
 
 ## 3. Get a report from real, live data
 
+The simplest way is `runAgent.js` — it takes any symbol, turns on all
+three live domains by default, and prints a readable report:
+
+```bash
+node --env-file=.env runAgent.js SPY
+node --env-file=.env runAgent.js MSFT --timeframes=1day,1week
+node --env-file=.env runAgent.js SPY --format=json     # raw structure
+node runAgent.js --help                                 # every flag
+```
+
+Position sizing is optional and all-six-or-nothing — supply every one
+of these or none, and nothing is ever assumed on your behalf:
+
+```bash
+node --env-file=.env runAgent.js SPY \
+  --balance=10000 --risk=0.01 --leverage=1 \
+  --entry=450.25 --stop=442.00 --contract=1
+```
+
+Without them the report honestly says `POSITION SIZE: DATA_UNAVAILABLE`
+and names the parameters that were missing. Supplying all six is also
+what lets a run reach `TRADE_SETUP_SUPPORTED`: with sizing unavailable,
+`EXECUTION_RISK` is always active, which floors risk at MODERATE and
+caps the verdict at `HIGH_RISK_REVIEW_REQUIRED`.
+
+Add `--llm` to also get the optional, isolated Claude commentary. It is
+printed in a separate block clearly marked ADVISORY and never
+influences `risk_decision`, `decision_status`, or `final_assessment`.
+
+Every `runAgent.js` run is appended to `data/runs.jsonl` (override with
+`RUN_STORE_FILE`), as are runs through the HTTP API.
+
+### The older, narrower runners
+
 Put real keys in `.env` (copy `.env.example`). **Nothing in this
 project loads `.env` by itself** — there is no `dotenv` (zero
 dependencies) and no entrypoint passes `--env-file`. You have to hand
@@ -61,9 +95,10 @@ Two honest limits worth knowing:
   `GNPCA` (real US GNP) — a macro backdrop, not an asset-specific signal.
   Override with `options.macroSeriesIds`.
 - **`runLive.js` requests one timeframe (daily).** The market adapter supports
-  `1day`, `1week` and `1month`; ask for more via `options.marketTimeframes`.
-  Each extra timeframe is one more Alpha Vantage request, and the free tier's
-  daily quota is small — that's why the default stays at one.
+  `1day`, `1week` and `1month`; ask for more via `options.marketTimeframes`
+  (or `runAgent.js --timeframes=`). Each extra timeframe is one more Alpha
+  Vantage request, and the free tier's daily quota is small — that's why the
+  default stays at one.
 
 None of the above needs `ANTHROPIC_API_KEY`. The deterministic
 pipeline never calls Claude and runs the same way with or without it.
@@ -117,8 +152,9 @@ Things to know before exposing it:
 ## 5. Where the output goes
 
 - `data/runs.jsonl` — one JSON line per completed run through
-  `/api/intelligence` or `runIntelligence.js`, credentials redacted.
-  Override the path with `RUN_STORE_FILE`.
+  `runAgent.js`, `runIntelligence.js`, `/api/intelligence` or
+  `/api/market-intelligence`, credentials redacted. Override the path
+  with `RUN_STORE_FILE`.
 - `logs/system.log` — one structured line per agent call, rotated at 5 MB.
 
 Both are gitignored.
