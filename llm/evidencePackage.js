@@ -1,6 +1,6 @@
 // Evidence Package Layer — Step 5B. Builds the single, versioned
-// "Evidence Package" that is the ONLY input the (not-yet-built) Claude
-// reasoning layer will ever see, per LLM_REASONING_LAYER_DESIGN.md §1.
+// "Evidence Package" that is the ONLY input the Claude reasoning layer
+// ever sees, per LLM_REASONING_LAYER_DESIGN.md §1.
 //
 // This is a pure, read-only transformation: buildEvidencePackage() never
 // mutates its inputs, never calls any agent/orchestrator/provider code,
@@ -31,8 +31,11 @@
 // so nothing downstream (including a future prompt-construction step)
 // can mutate it into a different fact.
 //
-// Not wired into app.js, server.js, the orchestrator, or any agent —
-// nothing calls this file yet.
+// Wired in (Step 5D) through llm/reasoningService.js ONLY, which
+// app.js calls as an optional post-processing step after the
+// deterministic pipeline has already produced its final result. This
+// file is never imported by server.js, the orchestrator, or any agent,
+// and it has no path back into a deterministic decision.
 
 const { UNKNOWN } = require("../core/constants");
 

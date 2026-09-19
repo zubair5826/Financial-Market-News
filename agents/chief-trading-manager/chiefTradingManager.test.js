@@ -196,6 +196,19 @@ test("8. RISK_TOO_HIGH forces HIGH_RISK_REVIEW_REQUIRED even when every speciali
   assert.equal(result.confidence, "LOW");
 });
 
+// 8b. An out-of-enum risk_decision passes reportValidation.js (which only
+// checks the field is present), so it can reach decisionStatus.js through
+// the public API; it must fail closed, never read as an acceptable risk.
+test("8b. an unrecognised risk_decision never yields TRADE_SETUP_SUPPORTED, even when every specialist is BULLISH", () => {
+  for (const bogus of ["RISK_OK", "risk_acceptable", "APPROVED"]) {
+    const inputs = allBullishInputs();
+    inputs.riskReport = riskReport({ risk_decision: bogus });
+    const result = processChiefDecision(inputs);
+    assert.equal(result.final_assessment, FINAL_ASSESSMENTS.BULLISH); // evidence direction is untouched...
+    assert.equal(result.decision_status, DECISION_STATUS.NO_DECISION); // ...but the invalid enum cannot support a trade
+  }
+});
+
 // 9. Missing critical data.
 test("9. no reports supplied at all returns UNKNOWN assessment and NO_DECISION, never a guess", () => {
   const result = processChiefDecision({});

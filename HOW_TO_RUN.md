@@ -22,20 +22,32 @@ node runDemo.js
 ```
 
 Feeds hand-built, clearly-labeled **sample data** (not real market data)
-through all 8 agents and prints the full structured report. `demo_output.json`
-holds a captured run.
+through all 8 agents and prints the full structured report to stdout.
+It writes no file; redirect it if you want to keep a run:
+`node runDemo.js > demo_output.json`.
 
 ## 3. Get a report from real, live data
 
-Put real keys in `.env` (copy `.env.example`). Then:
+Put real keys in `.env` (copy `.env.example`). **Nothing in this
+project loads `.env` by itself** — there is no `dotenv` (zero
+dependencies) and no entrypoint passes `--env-file`. You have to hand
+the variables to the process yourself:
 
 ```bash
-# Macro only (FRED). The lightest live runner.
-node runIntelligence.js "Assess SPY" "SPY"
+# Node 20.6+ can read the file directly:
+node --env-file=.env runIntelligence.js "Assess SPY" "SPY"   # macro only (FRED), lightest
+node --env-file=.env runLive.js                              # macro + AV candles + AV news
 
-# Macro + Alpha Vantage price candles + Alpha Vantage news.
+# Or export them, which works on every supported Node (18+):
+export FRED_API_KEY="..." ALPHAVANTAGE_API_KEY="..."
+node runIntelligence.js "Assess SPY" "SPY"
 node runLive.js
 ```
+
+If a key never reaches `process.env`, nothing crashes and nothing is
+invented — that provider reports `AUTH_FAILURE` and the affected domain
+comes back empty. A report that looks oddly empty is the first symptom
+of a `.env` that was never loaded.
 
 The instrument is taken from the `asset` argument and threaded through to
 every instrument-specific provider — `node runIntelligence.js "Assess MSFT" "MSFT"`

@@ -170,8 +170,10 @@ not run. `POST /api/intelligence` passes `options` straight through, so
 the layer is reachable over HTTP under the same opt-in rule.
 
 ### Tests
-**1440/1440 passing** across 103 test files as of the last full run
-(`npm test`, Node v22) — covers every core contract, all 8 agents, the
+**1473/1473 passing** across 104 test files as of the last full run
+(`npm test`, Node v22 — Step 119). Treat that number as a snapshot:
+`npm test` is the authoritative count. Coverage spans every core
+contract, all 8 agents, the
 orchestrator, both provider integrations (including mocked failure-mode
 coverage for `API_UNAVAILABLE`/`TIMEOUT`/`RATE_LIMIT`/`AUTH_FAILURE`),
 the complete Portfolio Intelligence stack, the HTTP API layer, and the
@@ -179,15 +181,18 @@ the complete Portfolio Intelligence stack, the HTTP API layer, and the
 test requires real credentials or makes a real network call.
 
 ### Git / deployment status
-- 5 commits on `main`, most recent `a5622b6` ("Add production HTTP
-  API").
-- Remote `origin` → `https://github.com/zubair5826/Financial-Market-News.git`,
-  pushed and up to date (`main` tracks `origin/main`, no divergence).
+
+> **Superseded.** The commit-level snapshot that used to sit here (5
+> commits, `a5622b6`, "not yet deployed") was already stale when Step
+> 117 audited git directly, and stating it twice with two different
+> answers made this file contradict itself. Step 117 below is the
+> authoritative git/deployment record; read that instead of trusting a
+> commit hash written down here. Only the two facts that do not change
+> with the next commit are kept:
+
+- Remote `origin` → `https://github.com/zubair5826/Financial-Market-News.git`.
 - `.env` is gitignored and confirmed never tracked; no credentials are
   committed anywhere in history.
-- Not yet actually deployed to any hosting platform (e.g. Railway) —
-  the code is push-ready and locally smoke-tested via `npm start`, but
-  no live production deployment exists yet.
 
 ### Step 106 — external review fixes (deployment hardening)
 
@@ -405,6 +410,147 @@ fails 3 of them (it previously failed none); removing only the
 Full suite: **1444/1444** (1440 + 4). Only the test file changed; no
 source file was touched.
 
+### Step 119 — full completion audit
+
+A whole-repository audit against a v1.x production-readiness bar. The
+repository was inspected before anything was changed; the suite was
+re-run first as a baseline (**1470/1470**, Node v22), `node --check`
+was run across all 228 JS files (clean), and the HTTP API, `runDemo.js`
+and graceful `SIGTERM` shutdown were exercised live rather than read.
+
+**Verdict: the system is complete.** All 8 agents, the orchestrator,
+both provider integrations, Portfolio Intelligence, the HTTP API, the
+LLM annotation layer, error handling, deployment configuration and the
+security model were each checked and found finished, not stubbed. No
+decision logic, risk calculation, `final_assessment` behavior,
+contract, response schema, or architecture was modified by this step,
+and no working functionality was removed.
+
+One real functional gap was found, and it was a documentation gap
+rather than a code one:
+
+- **Nothing in this project loads `.env`.** Zero dependencies means no
+  `dotenv`, and no entrypoint passes `--env-file`. `HOW_TO_RUN.md`
+  step 3 told a reader to put real keys in `.env` and then run
+  `node runIntelligence.js`, which silently reaches no provider — the
+  affected domain honestly reports `AUTH_FAILURE` and comes back empty,
+  so the failure is quiet rather than loud. `README.md`,
+  `HOW_TO_RUN.md` and `.env.example` now state this and give the three
+  real ways to supply the variables (`node --env-file=.env …` on Node
+  20.6+, shell export, or the deployment platform's own store).
+  `npm start`/`npm test` were deliberately left alone: adding
+  `--env-file` to either would raise the Node floor from 18 to 20.6 and
+  make the test suite depend on an uncommitted file.
+
+Documentation contradictions found and corrected:
+
+- `README.md`'s architecture section still said "There is no HTTP
+  server, no CLI, and no scheduler in this repository" — the same file
+  documents all four HTTP routes and five CLI runners further down.
+- `README.md`'s folder structure omitted `llm/`, `investment/`, `ci/`,
+  `.github/workflows/` and every root entrypoint.
+- `HOW_TO_RUN.md` referenced a `demo_output.json` that does not exist
+  and that `runDemo.js` never writes.
+- This file's "Git / deployment status" snapshot (5 commits,
+  `a5622b6`, "not yet deployed") contradicted Step 117's own direct
+  read of `.git` further down. Superseded in place.
+- This file's §4 still listed CI activation and deployment as
+  unstarted; Steps 116–117 record both as done.
+- The test count here was stale (1440/1444 → 1470 at audit time).
+- `ci/README.md` still instructed the reader to copy the workflow into
+  `.github/workflows/`, which had already been done, leaving two
+  byte-identical workflow files free to drift. Rewritten to name the
+  live file as the only one to edit.
+
+Stale comments corrected in three safety-critical wiring files, where a
+wrong comment is a real hazard rather than untidiness:
+
+- `llm/evidencePackage.js` claimed "nothing calls this file yet" and
+  described the reasoning layer as "not-yet-built". Both are wired.
+- `providers/fredMacroLiveSource.js` claimed it "is NOT wired into the
+  orchestrator — connecting it to the pipeline remains a separate,
+  future, separately-authorized step". It has been composed into the
+  pipeline since the application-service layer existed.
+- `server.js` said it calls "exactly two existing, unmodified
+  functions". It calls three.
+
+Two zero-behavior consistency fixes:
+
+- `agents/chief-trading-manager/index.js` and `report.js` declared
+  their own `const UNKNOWN = "UNKNOWN"` instead of importing the shared
+  sentinel from `core/constants.js`, as every other agent does.
+  Identical value, one source of truth.
+- `core/index.js`'s barrel was missing `core/dedupe.js`. Nothing
+  imports the barrel today, which is exactly how a core module stayed
+  out of it unnoticed, so `tests/coreIndex.test.js` (3 tests) now
+  asserts the barrel re-exports every core module, as the same binding,
+  and exports nothing a core module does not define.
+
+Reported and deliberately **not** changed, because each is decision
+logic and changing it needs an explicit decision (see §4):
+
+- `agents/chief-trading-manager/decisionStatus.js` fails **open** on an
+  unrecognized `risk_decision`: its documented rule 8 says "anything
+  not covered above → `NO_DECISION`", but the code returns
+  `TRADE_SETUP_SUPPORTED` for any value that is not
+  `RISK_REQUIRES_REVIEW` once the earlier guards pass. Unreachable
+  through the orchestrator, since the real Risk Manager only ever emits
+  the five `RISK_DECISIONS` values; reachable through the public
+  `runChiefTradingManager()`, because `reportValidation.js` checks that
+  a field is *present*, not that its value is in the enum.
+- `orchestrator/index.js`'s `processRequest()` never reads
+  `validateInputs().ok`, so a request with e.g. `marketData: "oops"`
+  returns `ok: true` carrying a `MALFORMED_DATA` entry in `errors`.
+  Consistent with the project's degrade-never-crash stance, but
+  undocumented.
+- `runMarketIntelligenceRequest()` can reject, which `server.js` turns
+  into a bare generic 500 rather than a structured `failSafe()` result.
+- `server.close()` does not call `closeIdleConnections()`, so a
+  keep-alive client can hold graceful shutdown open until the 10s
+  forced-exit fallback.
+
+Full suite after the change: **1473/1473** (1470 + 3 new barrel tests).
+
+### Update after Step 119 — decision-status fix implemented; preparing v1.2.1
+
+The Step 119 text above is left as written, because it was true when
+it was written. One of the items it reported as "not changed" has
+since been changed:
+
+- **`agents/chief-trading-manager/decisionStatus.js` no longer fails
+  open. IMPLEMENTED.** Any `risk_decision` outside the five Risk
+  Manager values (`RISK_ACCEPTABLE`, `RISK_REQUIRES_REVIEW`,
+  `RISK_TOO_HIGH`, `INSUFFICIENT_DATA`, `UNKNOWN`) now produces
+  `NO_DECISION`, as documented rule 8 always said. The check runs after
+  the `RISK_TOO_HIGH` override and the missing/`INSUFFICIENT_DATA`/
+  `UNKNOWN` guards and before any setup-status rule, so an invalid
+  value can never read as an acceptable risk. Behavior for the five
+  valid values is unchanged. The recognised set is exported as
+  `RECOGNISED_RISK_DECISIONS`.
+- **Regression tests are included:** 6 in `decisionStatus.test.js`
+  (unrecognised values across every setup status, a missing field, the
+  full valid-value matrix, and a check that the recognised set equals
+  the Risk Manager's `RISK_DECISIONS`) and 1 in
+  `chiefTradingManager.test.js` (an unrecognised value reaching the
+  public `processChiefDecision()` with every specialist bullish).
+- **Full suite: 1480 passed / 0 failed** (1473 + 7), `node --check`
+  clean across all 229 JS files.
+
+Still unresolved and unchanged: **`runMarketIntelligenceRequest()` can
+reject, which `server.js` turns into a bare generic 500.** A catch
+inside that service was tried and reverted, because the same function
+is reached through `/api/intelligence` and `runLive.js`, so it changed
+their behavior too, and the generic 500 is a documented, tested
+convention. The other two Step 119 items (`processRequest()` returning
+`ok: true` alongside a `MALFORMED_DATA` input error, and `server.close()`
+not calling `closeIdleConnections()`) are likewise unchanged.
+
+**Release state.** `package.json` is set to **1.2.1**. The tags
+`v1.2.0` (`4ae1ece`) and `v1.1.1` (`92fda34`) already exist locally and
+on `origin` and are unchanged; `package.json` read `0.1.0` at every
+earlier tag. This work is being prepared as **v1.2.1**. It is not yet
+committed or tagged.
+
 ## 2. In Progress
 
 Nothing is actively in progress — every capability above is complete
@@ -420,14 +566,13 @@ on anything.
   beyond the Step 15 audit already on record.
 - **No natural-language extraction of existing holdings** —
   `existingPortfolio` must be supplied as structured JSON today.
-- **Deployed, but from `origin/main` (`92fda34`), which predates every
-  change made in Steps 114–117.** The service is live and verified, but
-  the FRED market/news delegation, the documentation resync, and the
-  deployment configuration (`railway.json`, `.nvmrc`) are all still
-  local-only. Committing and pushing is the next action.
-- ~~The market/news delegation branch has no test.~~ Covered in Step
-  118 (tests 16-19); the branch is still uncommitted, but it is no
-  longer untested.
+- ~~Deployed from `origin/main` (`92fda34`), which predates Steps
+  114–117; the delegation branch, the documentation resync and
+  `railway.json`/`.nvmrc` are local-only.~~ Closed: the working tree is
+  committed and `origin/main` is up to date (verified at Step 119, on a
+  clean tree with the full suite green).
+- ~~The market/news delegation branch has no test.~~ Closed in Step 118
+  (tests 16-19), and committed since.
 - **No metrics/observability platform integration** — `logs/logger.js`
   covers structured agent- and HTTP-request-level events to a local,
   rotating file; there is no external metrics/APM/log-aggregation
@@ -461,9 +606,21 @@ on anything.
   existing CLI, if a real need for it is demonstrated.
 - Consider a sentiment data provider, if one is identified and
   evaluated the same way FRED/Alpha Vantage were.
-- Consider actual deployment to a hosting platform.
-- Activate CI (copy `ci/github-actions-test.yml` to
-  `.github/workflows/test.yml`) once ready to make it a merge gate.
+- Redirect `logs/system.log` during `npm test` (see §3) — needs a
+  deliberate decision about the two tests that assert against the real
+  `LOG_FILE`, so it is a step of its own, not a drive-by fix.
+- Decide the two fail-open edges Step 119 reported (below): the
+  unrecognized-`risk_decision` path in
+  `agents/chief-trading-manager/decisionStatus.js`, and
+  `processRequest()` returning `ok: true` while carrying a
+  `MALFORMED_DATA` input error. Both are decision logic and neither was
+  touched. *(Update: the first of the two, the unrecognized-
+  `risk_decision` path, is now fixed — see "Update after Step 119"
+  above. The second is unchanged.)*
+
+Deployment and CI activation used to be listed here as unstarted. Both
+are done — see Steps 116–117 — and were removed from this list because
+leaving them made this section contradict the record above it.
 
 None of the above is authorized or scheduled — this section exists
 only to record known open questions, not a roadmap commitment.

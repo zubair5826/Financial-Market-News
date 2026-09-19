@@ -14,10 +14,12 @@
 // body, a bearer-token check, and an in-memory per-IP counter — all of
 // which Node's standard library already provides.
 //
-// Calls exactly two existing, unmodified functions:
+// Calls exactly three existing, unmodified functions:
 //   - runApplicationRequest(request, options)  from ./app.js
 //   - runPortfolioIntelligenceRequest(request) from ./portfolioIntelligence.js
-// Neither is reimplemented, extended, or bypassed here.
+//   - runMarketIntelligenceRequest(request, options)
+//       from ./providers/marketIntelligenceApplicationService.js
+// None is reimplemented, extended, or bypassed here.
 //
 // Step 105 — security design:
 //   - Authentication: a single shared secret, API_AUTH_TOKEN, read

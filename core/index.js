@@ -7,6 +7,7 @@ module.exports = {
   ...require("./freshness"),
   ...require("./verification"),
   ...require("./confidence"),
+  ...require("./dedupe"),
   ...require("./hallucinationRules"),
   ...require("./dataRecord"),
   ...require("./agentMessage"),

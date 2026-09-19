@@ -58,11 +58,17 @@ STRUCTURED USER RESPONSE      <- { ok, asset, response, pipeline_summary,
 [orchestrator/index.js](orchestrator/index.js) via `processRequest()`.
 Every stage is a real, tested function; nothing here is a stub.
 
-**NOT IMPLEMENTED** — anything upstream of "USER REQUEST." There is no
-HTTP server, no CLI, and no scheduler in this repository. A caller
-invokes `processRequest(request)` directly (see [Data Flow](#data-flow)
-below); how a request eventually reaches that call (an API endpoint, a
-CLI, a cron job) is **FUTURE** and unspecified.
+**UPSTREAM OF "USER REQUEST"** — two entry layers exist today and both
+sit strictly above the pipeline, never inside it: an HTTP API
+([server.js](server.js) — see [HTTP API](#http-api-serverjs)) and a set
+of CLI runners ([runIntelligence.js](runIntelligence.js),
+[runLive.js](runLive.js), [runDemo.js](runDemo.js),
+[runPortfolioIntelligence.js](runPortfolioIntelligence.js),
+[runPortfolioScenarioComparison.js](runPortfolioScenarioComparison.js)).
+Each of them ultimately calls `processRequest(request)` — unmodified,
+exactly once per run. There is still **no scheduler** in this
+repository; running the system on a timer is **FUTURE** and
+unspecified.
 
 ## Data Flow
 
@@ -348,6 +354,38 @@ intended selector (`development` / `test` / `production`), read via
 or server entrypoint needs it — no code currently reads it. **No real
 credentials exist in this repo in any environment.**
 
+### How these variables actually reach the process
+
+**Nothing in this repository reads a `.env` file.** The project has
+zero npm dependencies, so there is no `dotenv`, and no entrypoint
+passes Node's `--env-file` flag. `.env`/[.env.example](.env.example)
+are the documented *place to keep* these values, not a mechanism that
+loads them — a key written to `.env` and nothing else is invisible to
+`process.env`, and the affected provider will correctly report
+`AUTH_FAILURE` rather than fail loudly.
+
+Supply them one of these three ways:
+
+```bash
+# 1. Node 20.6+ reads the file itself, with no dependency:
+node --env-file=.env server.js
+node --env-file=.env runLive.js
+
+# 2. Export them into the shell (works on every supported Node,
+#    including the Node 18 floor in package.json's engines):
+export API_AUTH_TOKEN="..." FRED_API_KEY="..."
+npm start
+
+# 3. In deployment: the platform's own variable/secret store
+#    (Railway, Docker, systemd, ...). This is the production path —
+#    no .env file is deployed. See Deployment above.
+```
+
+`npm start` and `npm test` are deliberately left as plain
+`node server.js` / `node --test`: adding `--env-file` to either would
+raise the project's Node floor from 18 to 20.6 and make `npm test`
+depend on a file that is, correctly, not committed.
+
 ### Every environment variable this system reads
 
 | Variable | Read only in | Effect if unset |
@@ -621,6 +659,25 @@ see [Fail-Safe Guarantees](#fail-safe-guarantees)).
   `runStore.js`. **IMPLEMENTED.**
 - `prompts/` — reserved for future agent system prompts. **NOT
   IMPLEMENTED** (empty).
+- `llm/` — the isolated, opt-in Claude/Anthropic annotation layer
+  (transport, Evidence Package, output/grounding/risk-boundary guards).
+  **IMPLEMENTED** — see Known Limitations. Never part of the
+  deterministic decision path.
+- `investment/` — Portfolio Intelligence domain modules (investor
+  profile extraction/validation, portfolio construction, scenario
+  comparison). **IMPLEMENTED.** No provider, no Market Intelligence
+  dependency.
+- `ci/` — a historical copy of the GitHub Actions workflow, kept from
+  before it could be written under `.github/` directly. The live
+  workflow is `.github/workflows/test.yml`; see [ci/README.md](ci/README.md).
+- `.github/workflows/` — CI: `npm test` on Node 18 and 22 for every
+  push and pull request, plus a guard that fails the build if a test
+  run wrote to the production `data/runs.jsonl`. **IMPLEMENTED.**
+
+Root-level entrypoints (all above the pipeline, none inside it):
+`server.js` (HTTP API), `app.js` (the single application boundary:
+freshness policy, run persistence, optional LLM annotation),
+`portfolioIntelligence.js`, and the `run*.js` CLI runners.
 
 ## Setup
 

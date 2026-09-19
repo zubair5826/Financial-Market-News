@@ -5,9 +5,11 @@
 // own — it constructs the existing, unmodified FredMacroAdapter and
 // delegates entirely to the existing, unmodified composeMacroData().
 //
-// It does NOT call processRequest() and is NOT wired into the
-// orchestrator — connecting it to the pipeline remains a separate,
-// future, separately-authorized step.
+// It does NOT call processRequest() itself and is never imported by
+// the orchestrator. Composition into the pipeline happens one layer
+// up, in providers/fredMacroApplicationService.js and
+// providers/marketIntelligenceApplicationService.js, each of which
+// calls the existing, unmodified processRequest() exactly once.
 
 const { FredMacroAdapter } = require("./adapters/fredMacroAdapter");
 const { composeMacroData } = require("./fredMacroComposer");

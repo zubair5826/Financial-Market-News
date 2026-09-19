@@ -5,7 +5,7 @@
 // both decision-intelligence output only — never an execution
 // instruction. See README.md.
 
-const UNKNOWN = "UNKNOWN";
+const { UNKNOWN } = require("../../core/constants");
 
 // Methodological assumptions this agent's own logic makes — never
 // assumptions about market behavior or outcomes. Kept short and

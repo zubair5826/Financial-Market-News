@@ -13,6 +13,11 @@
 //   2. No Risk Manager report supplied, or its own risk_decision is
 //      INSUFFICIENT_DATA/UNKNOWN: we don't know the risk yet, so we
 //      cannot responsibly support a trade -> WAIT_FOR_MORE_DATA.
+//   2b. Any risk_decision that is not one of the five Risk Manager
+//      values (RISK_ACCEPTABLE/RISK_REQUIRES_REVIEW/RISK_TOO_HIGH/
+//      INSUFFICIENT_DATA/UNKNOWN) is unrecognised and can never support
+//      a trade -> NO_DECISION. This is checked before any setup-status
+//      rule, so an invalid value is never treated as "acceptable".
 //   3. No Trade Setup report supplied, or its setup_status is
 //      DATA_UNAVAILABLE/INSUFFICIENT_DATA -> WAIT_FOR_MORE_DATA.
 //   4. Trade Setup's setup_status is CONFLICTING_EVIDENCE ->
@@ -35,6 +40,17 @@ const DECISION_STATUS = Object.freeze({
   NO_DECISION: "NO_DECISION",
 });
 
+// Mirrors agents/risk-manager/riskLevel.js's RISK_DECISIONS by value
+// (this agent deliberately does not import another agent); a test
+// asserts the two stay identical.
+const RECOGNISED_RISK_DECISIONS = new Set([
+  "RISK_ACCEPTABLE",
+  "RISK_REQUIRES_REVIEW",
+  "RISK_TOO_HIGH",
+  "INSUFFICIENT_DATA",
+  "UNKNOWN",
+]);
+
 function determineDecisionStatus({ tradeSetupSummary, riskSummary }) {
   if (riskSummary && riskSummary.risk_decision === "RISK_TOO_HIGH") {
     return DECISION_STATUS.HIGH_RISK_REVIEW_REQUIRED;
@@ -42,6 +58,10 @@ function determineDecisionStatus({ tradeSetupSummary, riskSummary }) {
 
   if (!riskSummary || riskSummary.risk_decision === "INSUFFICIENT_DATA" || riskSummary.risk_decision === "UNKNOWN") {
     return DECISION_STATUS.WAIT_FOR_MORE_DATA;
+  }
+
+  if (!RECOGNISED_RISK_DECISIONS.has(riskSummary.risk_decision)) {
+    return DECISION_STATUS.NO_DECISION;
   }
 
   if (!tradeSetupSummary || tradeSetupSummary.setup_status === "DATA_UNAVAILABLE" || tradeSetupSummary.setup_status === "INSUFFICIENT_DATA") {
@@ -65,4 +85,4 @@ function determineDecisionStatus({ tradeSetupSummary, riskSummary }) {
   return DECISION_STATUS.NO_DECISION;
 }
 
-module.exports = { DECISION_STATUS, determineDecisionStatus };
+module.exports = { DECISION_STATUS, RECOGNISED_RISK_DECISIONS, determineDecisionStatus };

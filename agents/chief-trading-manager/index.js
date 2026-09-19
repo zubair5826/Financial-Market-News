@@ -17,6 +17,7 @@
 // report.js and README.md.
 
 const { failSafe, ERROR_CODES } = require("../../core/errors");
+const { UNKNOWN } = require("../../core/constants");
 const { logEvent } = require("../../logs/logger");
 const { validateReport } = require("./reportValidation");
 const {
@@ -31,8 +32,6 @@ const { determineFinalAssessment, FINAL_ASSESSMENTS } = require("./finalAssessme
 const { buildConflictingEvidence } = require("./conflicts");
 const { determineDecisionStatus, DECISION_STATUS } = require("./decisionStatus");
 const { buildChiefReport } = require("./report");
-
-const UNKNOWN = "UNKNOWN";
 
 function resolveReport(rawReport, expectedAgentName, warnings) {
   if (!rawReport) return null;
