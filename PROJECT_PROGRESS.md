@@ -641,3 +641,21 @@ only to record known open questions, not a roadmap commitment.
   why (the project currently has zero npm dependencies).
 - Only build what is explicitly requested — do not get ahead of
   instructions.
+
+### Step 120 - full 8-agent audit completed after v1.2.1
+
+The post-release audit covered all eight specialist agents without modifying agent code. All agent-specific test suites passed in full:
+
+- Data Controller: 14/14 passed
+- News Agent: 26/26 passed
+- Macro Agent: 31/31 passed
+- Technical Agent: 46/46 passed
+- Sentiment Agent: 22/22 passed
+- Trade Setup Agent: 23/23 passed
+- Risk Manager: 20/20 passed
+- Chief Trading Manager: 24/24 passed
+
+The complete project suite was then rerun: 1480/1480 passed, 0 failed, 0 skipped, 0 cancelled. No concrete defect was identified during the audit and no agent code change was required.
+
+The working tree was checked after the audit. The only untracked path is Claude outputs/, which remains intentionally untracked. No tracked project files were modified by the audit.
+
