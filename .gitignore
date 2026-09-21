@@ -17,3 +17,4 @@ data/runs.jsonl
 # OS/editor cruft.
 .DS_Store
 Thumbs.db
+Claude outputs/
