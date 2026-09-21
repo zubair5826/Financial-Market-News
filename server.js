@@ -20,6 +20,19 @@
 //   - runAgentRequest(request, options)        from ./agentRequest.js
 // None is reimplemented, extended, or bypassed here.
 //
+// Step 121 — personal-use web interface: one additional, exact route,
+// `GET /`, serves the static file public/index.html and nothing else.
+// It is a plain file read — no templating, no data, no credential, and
+// no call into any intelligence function. The page itself holds no
+// token: the user types one in, and the page sends it as the same
+// `Authorization: Bearer` header every other client uses when it calls
+// the existing, unchanged POST /api/market-intelligence. Every API
+// route's authentication, rate limiting and body-size limit is exactly
+// as before; only `GET /` is exempt from the rate limiter (see
+// isUiPageRequest()), because loading the page is not an analysis
+// request. Any other method on `/` is rate-limited and answered 405,
+// and every other unknown path is still 404.
+//
 // /api/market-intelligence previously called
 // runMarketIntelligenceRequest() directly and therefore persisted
 // nothing — the one endpoint that actually gathers cross-domain live
@@ -75,6 +88,8 @@
 
 const http = require("http");
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 const { runApplicationRequest } = require("./app");
 const { runPortfolioIntelligenceRequest } = require("./portfolioIntelligence");
 const { runAgentRequest } = require("./agentRequest");
@@ -319,6 +334,44 @@ function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+// Step 121: the personal-use web interface. Resolved once, relative to
+// this file, so the served path never depends on the process's working
+// directory and can never be influenced by the request URL.
+const UI_PAGE_FILE = path.join(__dirname, "public", "index.html");
+
+// Response headers for the UI page. The Content-Security-Policy keeps
+// the page self-contained: no external script, style, font, image or
+// frame can load, and `connect-src 'self'` means the page's own fetch()
+// — the only thing that ever carries the user's API token — can reach
+// this same origin and nowhere else.
+const UI_PAGE_HEADERS = Object.freeze({
+  "Content-Type": "text/html; charset=utf-8",
+  "Cache-Control": "no-store",
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+  "Referrer-Policy": "no-referrer",
+  "Content-Security-Policy":
+    "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+});
+
+// True only for the exact request that loads the UI page. Used both to
+// route it and to exempt it (and only it) from the per-IP rate limiter.
+function isUiPageRequest(req, pathname) {
+  return pathname === "/" && req.method === "GET";
+}
+
+async function handleUiPage(req, res) {
+  if (req.method !== "GET") {
+    return sendJson(res, 405, { error: "Method Not Allowed", allowed: ["GET"] });
+  }
+  // A read failure (file missing/unreadable) throws into
+  // requestListener's catch and becomes the same generic 500 every
+  // other route uses — no path or error detail leaks to the client.
+  const html = await fs.promises.readFile(UI_PAGE_FILE);
+  res.writeHead(200, { ...UI_PAGE_HEADERS, "Content-Length": html.length });
+  res.end(html);
+}
+
 async function handleHealth(req, res) {
   if (req.method !== "GET") {
     return sendJson(res, 405, { error: "Method Not Allowed", allowed: ["GET"] });
@@ -442,6 +495,7 @@ async function handleMarketIntelligence(req, res) {
 }
 
 const ROUTES = {
+  "/": handleUiPage,
   "/health": handleHealth,
   "/api/intelligence": handleIntelligence,
   "/api/portfolio-intelligence": handlePortfolioIntelligence,
@@ -488,7 +542,11 @@ async function requestListener(req, res) {
     // hitting an unknown route, the wrong method, or a malformed body
     // (Step 105 requirement 9); all of those still count against the
     // caller's IP first.
-    if (pathname !== "/health") {
+    // Step 121: `GET /` (the static UI page) is also exempt — loading
+    // the page is not an analysis request and must not spend one. Only
+    // that exact method+path is exempt; POST / and every API route are
+    // counted exactly as before.
+    if (pathname !== "/health" && !isUiPageRequest(req, pathname)) {
       const ip = getClientIp(req);
       const { limited, retryAfterSeconds } = checkRateLimit(ip);
       if (limited) {
@@ -540,6 +598,8 @@ function shutdown(signal) {
 if (require.main === module) {
   server.listen(PORT, HOST, () => {
     console.log(`Server listening on ${HOST}:${PORT}`);
+    const uiHost = HOST === "0.0.0.0" ? "localhost" : HOST;
+    console.log(`Web interface: http://${uiHost}:${PORT}/  (enter your API_AUTH_TOKEN on the page)`);
     if (HOST === "127.0.0.1" || HOST === "localhost") {
       console.log("Bound to loopback only. Set HOST=0.0.0.0 to accept connections from outside this machine (required on Railway and other container platforms).");
     }
@@ -551,4 +611,4 @@ if (require.main === module) {
   process.on("SIGINT", () => shutdown("SIGINT"));
 }
 
-module.exports = { server, requestListener, shutdown, getClientIp, isProxyTrusted, getRunStoreOptions, MAX_BODY_BYTES, RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_REQUESTS, HOST };
+module.exports = { server, requestListener, shutdown, getClientIp, isProxyTrusted, getRunStoreOptions, MAX_BODY_BYTES, RATE_LIMIT_WINDOW_MS, RATE_LIMIT_MAX_REQUESTS, HOST, UI_PAGE_FILE };

@@ -95,26 +95,42 @@ Market Intelligence dependency)
   output contract (`status, baseProfile, scenarios,
   allocationDifferences, unallocatedDifference, currencyMismatch,
   notes`).
-- **CLI wrappers**: `runIntelligence.js` (Market Intelligence, FRED
-  only), `runPortfolioIntelligence.js` (with a `--existing-portfolio`
+- **CLI wrappers**: `runAgent.js` (the general-purpose personal CLI:
+  any symbol, all three live domains on by default, readable text via
+  `agentReportText.js` or `--format=json`, built on
+  `agentRequest.js`'s `runAgentRequest()`), `runIntelligence.js`
+  (Market Intelligence, FRED only), `runPortfolioIntelligence.js` (with a `--existing-portfolio`
   flag), `runPortfolioScenarioComparison.js` (JSON-request CLI).
 
 ### Production HTTP API (`server.js`)
 Minimal HTTP server using only Node's built-in `http` module — no
 Express or other framework:
+- `GET /` → the static personal-use web interface, `public/index.html`
+  (Step 121 below). No auth needed to load it (it holds no token) and
+  not rate-limited; exact path and method only.
 - `GET /health` → `200 {"status":"ok"}`
 - `POST /api/intelligence` → calls the existing, unmodified
   `runApplicationRequest()` (from `app.js`); FRED is only touched if
   the caller's own request body sets `options.macro.enabled === true`
 - `POST /api/portfolio-intelligence` → calls the existing, unmodified
   `runPortfolioIntelligenceRequest()`; never touches any provider
-- `POST /api/market-intelligence` → calls the existing, unmodified
+- `POST /api/market-intelligence` → calls `runAgentRequest()`
+  (`agentRequest.js`), which calls the existing, unmodified
   `runMarketIntelligenceRequest()` (the live multi-source path
-  `runLive.js` uses) and returns its `{ pipelineResult, diagnostics }`
-  shape verbatim. Each provider domain is touched only when the
-  caller's own `options.{macro,market,news}.enabled === true` — the
-  same disabled-by-default rule as `/api/intelligence`. No persistence
-  and no LLM annotation on this route.
+  `runLive.js` uses) and then reuses the existing run store and the
+  existing optional Claude layer. Returns
+  `{ pipelineResult, diagnostics, persistence, llmAnnotation }`:
+  `pipelineResult`/`diagnostics` verbatim from
+  `runMarketIntelligenceRequest()`, plus the two additive fields. Every
+  run is **persisted** to the run store (honoring `RUN_STORE_FILE` and a
+  body-supplied `options.runStore`), and `llmAnnotation` is `null`
+  unless the caller sets `options.llm.enabled === true` (advisory only,
+  exactly as on `/api/intelligence`). Each provider domain is touched
+  only when the caller's own `options.{macro,market,news}.enabled ===
+  true` — `runAgentRequest()` enables none of them itself. *(An earlier
+  revision of this file said this route had no persistence and no LLM
+  annotation; that was true before `agentRequest.js` existed and was
+  corrected in Step 121.)* This is the endpoint the web interface calls.
 - Request-body size limit, malformed/invalid-JSON handling, generic
   500s with no leaked stack traces or internals, 404 for unknown
   routes, 405 for unsupported methods, graceful `SIGTERM`/`SIGINT`
@@ -170,8 +186,8 @@ not run. `POST /api/intelligence` passes `options` straight through, so
 the layer is reachable over HTTP under the same opt-in rule.
 
 ### Tests
-**1473/1473 passing** across 104 test files as of the last full run
-(`npm test`, Node v22 — Step 119). Treat that number as a snapshot:
+**1559/1559 passing** across 108 test files as of the last full run
+(`npm test`, Node v22 — Step 121). Treat that number as a snapshot:
 `npm test` is the authoritative count. Coverage spans every core
 contract, all 8 agents, the
 orchestrator, both provider integrations (including mocked failure-mode
@@ -559,6 +575,9 @@ on anything.
 
 ## 3. Not Yet Implemented
 
+- **The web interface covers Market Intelligence only** — it has no
+  page for Portfolio Intelligence or Scenario Comparison, and no view
+  of past runs in `data/runs.jsonl`.
 - **No HTTP endpoint for Portfolio Scenario Comparison** — it has a
   CLI (`runPortfolioScenarioComparison.js`) but no `/api/...` route.
 - **No sentiment or generic-market-data provider** — both remain
@@ -659,3 +678,74 @@ The complete project suite was then rerun: 1480/1480 passed, 0 failed, 0 skipped
 
 The working tree was checked after the audit. The only untracked path is Claude outputs/, which remains intentionally untracked. No tracked project files were modified by the audit.
 
+
+### Step 121 - personal-use web interface (`GET /`)
+
+The first browser UI for the project. Nothing in the decision path was
+touched: no agent, the orchestrator, `agentRequest.js`, `runAgent.js`,
+`agentReportText.js`, and the `/api/market-intelligence` handler are all
+unchanged, and there are still zero npm dependencies.
+
+- **`public/index.html` (new).** One self-contained plain HTML/CSS/JS
+  file, no build step. Inputs: symbol, question, Macro/Market/News
+  checkboxes (all on by default), optional market timeframes, the six
+  optional position-sizing values, the API token, and an optional
+  Claude checkbox (off by default). It builds the same
+  `{ request, options }` pair `runAgent.js` builds, sets
+  `options.{macro,market,news}.enabled` explicitly from the
+  checkboxes, and sends it to the existing `POST /api/market-intelligence`
+  with `Authorization: Bearer <token>`. Results show the Decision
+  (`final_assessment`, `decision_status`) first, labelled as the
+  deterministic assessment and not an order or trade execution; then
+  data quality and risk (risk decision/level, freshness/quality flags,
+  position sizing, invalidation conditions); the macro,
+  market/technical, news and sentiment summaries; the trade setup
+  (status, direction, `setup_quality`, potential levels); evidence,
+  uncertainties, warnings, errors and sources; provider diagnostics and
+  the run ID; `llmAnnotation` only in a separate block labelled
+  **ADVISORY — CLAUDE**; and a collapsed "Show raw JSON". Missing fields
+  render as `UNKNOWN`. Loading state, and clear messages for a missing
+  token, 401, 429 (with Retry-After), 5xx, non-JSON and network
+  failures. The token is kept in memory, or in `sessionStorage` only if
+  the user ticks "remember for this tab"; it is never hardcoded.
+  All response values are written with `textContent`, never
+  `innerHTML`, so provider text cannot inject markup.
+- **`server.js`.** One new exact route, `GET /`, reads and returns
+  `public/index.html` (path fixed relative to `server.js`, never taken
+  from the URL) with `Content-Security-Policy` (`default-src 'none'`,
+  `connect-src 'self'`, `frame-ancestors 'none'`), `X-Frame-Options:
+  DENY`, `X-Content-Type-Options: nosniff`, `Cache-Control: no-store`
+  and `Referrer-Policy: no-referrer`. Only `GET /` is exempt from the
+  per-IP rate limiter; `POST /` (405) and every API route are counted
+  exactly as before. Other methods on `/` → 405; `/index.html`,
+  `/public/...` and all other unknown paths → 404; a failed file read →
+  the usual generic 500. Auth, body-size limit, `/health`, logging and
+  graceful shutdown are unchanged. The startup banner now prints the
+  web-interface URL.
+- **Tests.** 10 new tests in `server.test.js` (121-1 … 121-10): `GET /`
+  returns 200 HTML identical to the file, security headers, no token
+  needed or embedded (and the API still fails closed with no token
+  configured), 404 for unknown and file-like paths, 405 for other
+  methods, the rate-limit exemption is exactly `GET /`, the
+  market-intelligence API's 401/200 behavior and four-field shape are
+  unchanged, the generic 500 on a read failure, the fixed page path,
+  and static checks on the page (single endpoint, no hardcoded token,
+  no `localStorage`, domains on / Claude off by default, no `innerHTML`,
+  no execution surface).
+- **Also verified in a real headless browser** (not part of `npm test`):
+  missing-token and 401 messages, a full live-path run with no
+  provider keys (every domain honestly `AUTH_FAILURE`, Decision
+  `INSUFFICIENT_DATA` / `WAIT_FOR_MORE_DATA`, no `undefined`/`null`
+  shown), a rich result with a VALID advisory block, the no-report
+  path, 500 and 429 messages, and a 400 px-wide layout with no
+  horizontal scroll.
+- **Docs.** `README.md` (new Web interface section, route table, `GET /`
+  security notes, folder structure), `HOW_TO_RUN.md` (new section 4),
+  and this file (the stale `/api/market-intelligence` description
+  above corrected; `runAgent.js` added to the CLI list; test count).
+
+Full suite: **1559/1559** passed, 0 failed (1549 before this step + 10
+new). Note: Step 120 above recorded 1480; the suite had already grown
+to 1549 before this step began (tests added after Step 120, e.g. for
+`agentRequest.js`, `runAgent.js` and `agentReportText.js`), which this
+file had not yet recorded. `node --check server.js` is clean. Not committed or tagged.

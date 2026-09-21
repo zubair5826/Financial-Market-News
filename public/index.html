@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Market Intelligence</title>
+<!--
+  Personal-use web interface for the Financial Market News project.
+
+  A thin, read-only front end over the EXISTING POST /api/market-intelligence
+  endpoint. It adds no intelligence logic, no new API contract, and no
+  decision of its own: it builds the same { request, options } pair
+  runAgent.js builds, sends it with the caller's own bearer token, and
+  displays what the deterministic pipeline returned.
+
+  - No broker, exchange, order, or trade-execution function exists here or
+    anywhere this page can reach. final_assessment / decision_status /
+    risk_decision are decision-intelligence labels, not instructions.
+  - The API token is typed by the user, kept in memory, and only copied to
+    sessionStorage when the user ticks "remember for this tab". It is never
+    hardcoded, never put in a URL, and only ever sent to this same origin.
+  - The optional Claude layer is OFF by default. When on, its output is
+    shown last, in a separate block labelled ADVISORY — CLAUDE, and it is
+    never presented as the decision.
+  - Every value from the response is written with textContent, never
+    innerHTML, so provider text (e.g. news headlines) cannot inject markup.
+-->
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1b1f24; --muted: #5d6673;
+    --border: #d9dde3; --accent: #1f5fbf; --accent-text: #ffffff;
+    --warn-bg: #fff6e0; --warn-border: #e0b44c;
+    --err-bg: #fdecec; --err-border: #d9534f;
+    --adv-bg: #f3effc; --adv-border: #7a5cc4;
+    --code-bg: #eef0f3; --unknown: #8a6d1f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121418; --panel: #1b1e24; --text: #e6e8eb; --muted: #9aa3ad;
+      --border: #2f343c; --accent: #5b9bff; --accent-text: #0b0d10;
+      --warn-bg: #2d2610; --warn-border: #a88a2f;
+      --err-bg: #331818; --err-border: #c0504d;
+      --adv-bg: #231d33; --adv-border: #9a7fe0;
+      --code-bg: #14161a; --unknown: #d9b85c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 980px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 1.4rem; margin: 8px 0 2px; }
+  h2 { font-size: 1.1rem; margin: 0 0 10px; }
+  h3 { font-size: 0.95rem; margin: 12px 0 6px; }
+  .sub { color: var(--muted); margin: 0 0 16px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 16px; margin-bottom: 16px;
+  }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+  label { display: block; font-weight: 600; font-size: 0.9rem; margin-bottom: 4px; }
+  .hint { font-weight: 400; color: var(--muted); font-size: 0.82rem; }
+  input[type="text"], input[type="password"], input[type="number"] {
+    width: 100%; padding: 8px; border: 1px solid var(--border); border-radius: 6px;
+    background: var(--bg); color: var(--text); font: inherit;
+  }
+  .checks { display: flex; flex-wrap: wrap; gap: 16px; margin: 4px 0; }
+  .checks label { display: flex; align-items: center; gap: 6px; font-weight: 500; margin: 0; }
+  fieldset { border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; margin: 12px 0 0; }
+  legend { font-weight: 600; font-size: 0.9rem; padding: 0 4px; }
+  button {
+    background: var(--accent); color: var(--accent-text); border: 0; border-radius: 6px;
+    padding: 10px 20px; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button:disabled { opacity: 0.6; cursor: progress; }
+  .actions { display: flex; align-items: center; gap: 14px; margin-top: 14px; flex-wrap: wrap; }
+  .status { color: var(--muted); }
+  .notice { border-radius: 6px; padding: 10px 12px; margin: 8px 0; border: 1px solid; }
+  .notice.warn { background: var(--warn-bg); border-color: var(--warn-border); }
+  .notice.error { background: var(--err-bg); border-color: var(--err-border); }
+  .decision { border: 2px solid var(--accent); }
+  .decision .big { display: flex; flex-wrap: wrap; gap: 12px 32px; margin: 6px 0 10px; }
+  .decision .big div span { display: block; }
+  .decision .big .k { font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; }
+  .decision .big .v { font-size: 1.3rem; font-weight: 700; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.9rem; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; width: 38%; }
+  .kv th { width: 38%; }
+  .wide th { width: auto; }
+  .unknown { color: var(--unknown); font-style: italic; }
+  ul { margin: 4px 0 8px; padding-left: 20px; }
+  li { margin: 2px 0; word-break: break-word; }
+  .none { color: var(--muted); font-style: italic; }
+  .domain { border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; }
+  .advisory { background: var(--adv-bg); border: 2px dashed var(--adv-border); }
+  .advisory .tag { font-weight: 800; letter-spacing: 0.05em; color: var(--adv-border); }
+  pre {
+    background: var(--code-bg); border-radius: 6px; padding: 10px; overflow: auto;
+    max-height: 520px; font-size: 0.8rem; white-space: pre-wrap; word-break: break-word;
+  }
+  details summary { cursor: pointer; font-weight: 600; }
+  .hidden { display: none; }
+  .spinner {
+    display: inline-block; width: 14px; height: 14px; border: 2px solid var(--muted);
+    border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite;
+    vertical-align: -2px; margin-right: 6px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Market Intelligence</h1>
+  <p class="sub">Personal-use front end for the deterministic 8-agent pipeline.
+    Decision intelligence only &mdash; no broker or exchange is connected, and nothing here places, changes, or executes a trade.</p>
+
+  <form id="analyze-form" class="panel" autocomplete="off" novalidate>
+    <h2>Ask</h2>
+    <div class="grid">
+      <div>
+        <label for="asset">Symbol / asset <span class="hint">(required, e.g. SPY, MSFT)</span></label>
+        <input id="asset" name="asset" type="text" maxlength="32" spellcheck="false" required>
+      </div>
+      <div style="grid-column: span 2;">
+        <label for="query">Market question <span class="hint">(optional &mdash; default "Assess &lt;SYMBOL&gt;")</span></label>
+        <input id="query" name="query" type="text" maxlength="500">
+      </div>
+    </div>
+
+    <fieldset>
+      <legend>Live data domains</legend>
+      <div class="checks">
+        <label><input id="opt-macro" type="checkbox" checked> Macro (FRED)</label>
+        <label><input id="opt-market" type="checkbox" checked> Market (Alpha Vantage price candles)</label>
+        <label><input id="opt-news" type="checkbox" checked> News (Alpha Vantage news + derived sentiment)</label>
+      </div>
+      <div style="margin-top: 8px; max-width: 360px;">
+        <label for="timeframes">Market timeframes <span class="hint">(optional, comma-separated: 1day, 1week, 1month)</span></label>
+        <input id="timeframes" type="text" placeholder="1day" spellcheck="false">
+        <div class="hint">Each extra timeframe is one more Alpha Vantage request against a small free-tier quota.</div>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Position sizing <span class="hint">(optional &mdash; supply all six or none; nothing is ever assumed)</span></legend>
+      <div class="grid">
+        <div><label for="sz-balance">Account balance</label><input id="sz-balance" type="text" inputmode="decimal" placeholder="10000"></div>
+        <div><label for="sz-risk">Risk fraction <span class="hint">(0.01 = 1%)</span></label><input id="sz-risk" type="text" inputmode="decimal" placeholder="0.01"></div>
+        <div><label for="sz-leverage">Leverage</label><input id="sz-leverage" type="text" inputmode="decimal" placeholder="1"></div>
+        <div><label for="sz-entry">Entry price</label><input id="sz-entry" type="text" inputmode="decimal"></div>
+        <div><label for="sz-stop">Stop price</label><input id="sz-stop" type="text" inputmode="decimal"></div>
+        <div><label for="sz-contract">Contract size</label><input id="sz-contract" type="text" inputmode="decimal" placeholder="1"></div>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Access</legend>
+      <div class="grid">
+        <div style="grid-column: span 2;">
+          <label for="token">API token <span class="hint">(the server's API_AUTH_TOKEN)</span></label>
+          <input id="token" type="password" autocomplete="off" spellcheck="false">
+          <div class="checks" style="margin-top: 6px;">
+            <label><input id="remember-token" type="checkbox"> Remember for this browser tab only (sessionStorage)</label>
+          </div>
+        </div>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Optional Claude commentary</legend>
+      <div class="checks">
+        <label><input id="opt-llm" type="checkbox"> Add ADVISORY Claude commentary (off by default; needs ANTHROPIC_API_KEY on the server)</label>
+      </div>
+      <div class="hint">It runs only after the deterministic result is final and can never change final_assessment, decision_status, or risk_decision.</div>
+    </fieldset>
+
+    <div class="actions">
+      <button id="analyze" type="submit">Analyze</button>
+      <span id="status" class="status" role="status" aria-live="polite"></span>
+    </div>
+    <div id="form-warnings"></div>
+  </form>
+
+  <div id="error" class="notice error hidden" role="alert"></div>
+  <div id="results"></div>
+</main>
+
+<script>
+"use strict";
+(function () {
+  var ENDPOINT = "/api/market-intelligence";
+  var TOKEN_KEY = "fmn.apiToken";
+  var UNKNOWN = "UNKNOWN";
+
+  // The six parameters agents/risk-manager/positionSizing.js requires,
+  // mapped exactly as runAgent.js's SIZING_FLAGS maps them.
+  var SIZING_FIELDS = [
+    ["sz-balance", "accountBalance"],
+    ["sz-risk", "riskPercentage"],
+    ["sz-leverage", "leverage"],
+    ["sz-entry", "entryPrice"],
+    ["sz-stop", "stopPrice"],
+    ["sz-contract", "contractSize"]
+  ];
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  // ---- token handling: memory by default, sessionStorage only on opt-in ----
+  var memoryToken = "";
+  function storageGet() {
+    try { return window.sessionStorage.getItem(TOKEN_KEY) || ""; } catch (e) { return ""; }
+  }
+  function storageSet(value) {
+    try { window.sessionStorage.setItem(TOKEN_KEY, value); } catch (e) { /* unavailable: memory only */ }
+  }
+  function storageClear() {
+    try { window.sessionStorage.removeItem(TOKEN_KEY); } catch (e) { /* ignore */ }
+  }
+  (function restoreToken() {
+    var saved = storageGet();
+    if (saved) {
+      memoryToken = saved;
+      $("token").value = saved;
+      $("remember-token").checked = true;
+    }
+  })();
+  $("token").addEventListener("input", function () {
+    memoryToken = $("token").value;
+    if ($("remember-token").checked) storageSet(memoryToken.trim());
+  });
+  $("remember-token").addEventListener("change", function () {
+    if ($("remember-token").checked && memoryToken.trim()) storageSet(memoryToken.trim());
+    else storageClear();
+  });
+
+  // ---- request building: the same { request, options } runAgent.js builds ----
+  function asList(raw) {
+    if (typeof raw !== "string") return undefined;
+    var items = raw.split(",").map(function (s) { return s.trim(); }).filter(function (s) { return s.length > 0; });
+    return items.length > 0 ? items : undefined;
+  }
+
+  function buildInvocation() {
+    var warnings = [];
+    var asset = $("asset").value.trim();
+    var queryRaw = $("query").value.trim();
+    var query = queryRaw || ("Assess " + (asset || UNKNOWN));
+
+    var requestOptions = {};
+    var params = {};
+    var supplied = 0;
+    SIZING_FIELDS.forEach(function (pair) {
+      var raw = $(pair[0]).value.trim();
+      if (raw === "") return;
+      supplied += 1;
+      var parsed = Number(raw);
+      if (Number.isFinite(parsed)) params[pair[1]] = parsed;
+      else warnings.push("\"" + raw + "\" is not a number for " + pair[1] + " — it was ignored, never guessed.");
+    });
+    if (supplied > 0) {
+      requestOptions.positionSizingParams = params;
+      if (supplied < SIZING_FIELDS.length) {
+        warnings.push("Only " + supplied + " of 6 position-sizing values were supplied. They are sent as-is; the Risk Manager will report POSITION SIZE: DATA_UNAVAILABLE and name what is missing.");
+      }
+    }
+
+    var request = { query: query, asset: asset, options: requestOptions };
+    var options = {
+      macro: { enabled: $("opt-macro").checked === true },
+      market: { enabled: $("opt-market").checked === true },
+      news: { enabled: $("opt-news").checked === true }
+    };
+    var timeframes = asList($("timeframes").value);
+    if (timeframes) options.marketTimeframes = timeframes;
+    if ($("opt-llm").checked === true) options.llm = { enabled: true };
+
+    if (!options.macro.enabled && !options.market.enabled && !options.news.enabled) {
+      warnings.push("No live data domain is enabled, so no provider will be called and every specialist will report its own DATA UNAVAILABLE state.");
+    }
+    return { request: request, options: options, asset: asset, warnings: warnings };
+  }
+
+  // ---- small DOM helpers (textContent only) ----
+  function el(tag, attrs, children) {
+    var node = document.createElement(tag);
+    if (attrs) {
+      Object.keys(attrs).forEach(function (k) {
+        if (k === "class") node.className = attrs[k];
+        else if (k === "text") node.textContent = attrs[k];
+        else node.setAttribute(k, attrs[k]);
+      });
+    }
+    (children || []).forEach(function (c) {
+      if (c === null || c === undefined) return;
+      node.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
+    });
+    return node;
+  }
+
+  function isMissing(v) { return v === null || v === undefined || v === ""; }
+
+  function compact(v, max) {
+    var text;
+    try { text = JSON.stringify(v); } catch (e) { return "(unserializable value)"; }
+    if (typeof text !== "string") return "(unserializable value)";
+    max = max || 400;
+    return text.length > max ? text.slice(0, max) + "… (truncated — see raw JSON)" : text;
+  }
+
+  // Formats any value for display. Missing -> UNKNOWN (styled), never
+  // "undefined"/"null"; booleans/numbers as text; objects as compact JSON.
+  function val(v) {
+    if (isMissing(v)) return el("span", { class: "unknown", text: UNKNOWN });
+    if (typeof v === "object") return document.createTextNode(compact(v));
+    return document.createTextNode(String(v));
+  }
+
+  function kvTable(rows, cls) {
+    var tbody = el("tbody");
+    rows.forEach(function (r) {
+      tbody.appendChild(el("tr", null, [el("th", { text: r[0] }), el("td", null, [r[1] instanceof Node ? r[1] : val(r[1])])]));
+    });
+    return el("table", { class: cls || "kv" }, [tbody]);
+  }
+
+  function list(items, render) {
+    if (!Array.isArray(items) || items.length === 0) return el("p", { class: "none", text: "(none)" });
+    var ul = el("ul");
+    items.forEach(function (item) {
+      ul.appendChild(el("li", null, [render ? render(item) : val(item)]));
+    });
+    return ul;
+  }
+
+  function panel(title, children, cls) {
+    return el("section", { class: "panel" + (cls ? " " + cls : "") }, [el("h2", { text: title })].concat(children));
+  }
+
+  function textOf(entry) {
+    if (entry && typeof entry === "object") {
+      if (!isMissing(entry.message)) return val(entry.code ? entry.code + ": " + entry.message : entry.message);
+      return val(entry);
+    }
+    return val(entry);
+  }
+
+  function renderConflict(entry) {
+    if (!entry || typeof entry !== "object") return val(entry);
+    if (entry.type === "SPECIALIST_DISAGREEMENT" && entry.reason) return val("SPECIALIST_DISAGREEMENT: " + entry.reason);
+    if (entry.type === "INTERNAL_CONFLICT") {
+      var count = Array.isArray(entry.detail) ? entry.detail.length : 1;
+      return val("INTERNAL_CONFLICT in " + (isMissing(entry.domain) ? UNKNOWN : entry.domain) + ": " + count + " conflict(s) — " + compact(entry.detail, 300));
+    }
+    return val(entry);
+  }
+
+  function renderSupporting(entry) {
+    if (!entry || typeof entry !== "object") return val(entry);
+    var f = function (x) { return isMissing(x) ? UNKNOWN : String(x); };
+    return val(f(entry.domain) + ": bias " + f(entry.bias) + " (confidence " + f(entry.confidence) + ")");
+  }
+
+  // ---- sections ----
+  function renderDecision(result, report) {
+    var riskSummary = report.risk_summary || {};
+    var big = el("div", { class: "big" }, [
+      el("div", null, [el("span", { class: "k", text: "final_assessment" }), el("span", { class: "v" }, [val(report.final_assessment)])]),
+      el("div", null, [el("span", { class: "k", text: "decision_status" }), el("span", { class: "v" }, [val(report.decision_status)])])
+    ]);
+    return panel("Decision", [
+      el("div", { class: "notice warn" }, [
+        el("strong", { text: "Deterministic assessment only. " }),
+        "Produced by the hand-written 8-agent pipeline. This is decision intelligence, not an order, not a recommendation to trade, and not trade execution. No broker or exchange is connected."
+      ]),
+      big,
+      kvTable([
+        ["Instrument", result.pipelineResult && result.pipelineResult.asset],
+        ["Overall confidence", report.confidence],
+        ["risk_decision", riskSummary.risk_decision],
+        ["Pipeline timestamp", result.pipelineResult && result.pipelineResult.timestamp]
+      ])
+    ], "decision");
+  }
+
+  function renderRisk(report) {
+    var rs = report.risk_summary || null;
+    var dq = (rs && rs.data_quality) || null;
+    var flag = function (x) { return dq ? String(Boolean(x)) : UNKNOWN; };
+    var sizing = rs && rs.position_size_status;
+    var sizingRows = sizing
+      ? [
+          ["status", sizing.status],
+          ["position_size", sizing.position_size],
+          ["units", sizing.units],
+          ["risk_amount", sizing.risk_amount],
+          ["missing parameters", Array.isArray(sizing.missing_parameters) && sizing.missing_parameters.length ? sizing.missing_parameters.join(", ") : "(none)"],
+          ["notes", sizing.notes]
+        ]
+      : [["status", UNKNOWN]];
+    var inv = rs && rs.invalidation_assessment;
+    return panel("Data quality & risk", [
+      el("div", { class: "grid" }, [
+        el("div", null, [el("h3", { text: "Risk" }), kvTable([
+          ["risk_decision", rs && rs.risk_decision],
+          ["risk_level", rs && rs.risk_level],
+          ["risk categories", rs && Array.isArray(rs.risk_categories) && rs.risk_categories.length ? rs.risk_categories.join(", ") : (rs ? "(none)" : UNKNOWN)],
+          ["risk confidence", rs && rs.confidence]
+        ])]),
+        el("div", null, [el("h3", { text: "Data quality" }), kvTable([
+          ["freshness_status", dq && dq.freshnessStatus],
+          ["data_quality_status", dq && dq.qualityStatus],
+          ["stale inputs", flag(dq && dq.stale)],
+          ["unverified inputs", flag(dq && dq.unverified)],
+          ["conflicting inputs", flag(dq && dq.conflicting)]
+        ])])
+      ]),
+      el("h3", { text: "Position sizing (as computed by the Risk Manager)" }),
+      kvTable(sizingRows),
+      el("h3", { text: "Invalidation conditions" }),
+      inv && Array.isArray(inv.conditions)
+        ? list(inv.conditions, function (c) {
+            if (!c || typeof c !== "object") return val(c);
+            var f = function (x) { return isMissing(x) ? UNKNOWN : String(x); };
+            return val(f(c.condition) + " " + f(c.level) + " (" + f(c.timeframe) + ") — " + f(c.reason));
+          })
+        : el("p", { class: "none", text: inv ? "status: " + (isMissing(inv.status) ? UNKNOWN : inv.status) : "(none)" })
+    ]);
+  }
+
+  function domainBox(title, summary, extraRows) {
+    if (!summary) {
+      return el("div", { class: "domain" }, [el("h3", { text: title }), el("p", { class: "none", text: "NOT AVAILABLE — no report reached the Chief Trading Manager." })]);
+    }
+    var rows = [["bias", summary.bias], ["confidence", summary.confidence]].concat(extraRows || []);
+    rows.push(["sources", Array.isArray(summary.sources) && summary.sources.length ? summary.sources.join(", ") : "(none)"]);
+    rows.push(["internal conflicts", Array.isArray(summary.conflicts) ? String(summary.conflicts.length) : UNKNOWN]);
+    rows.push(["timestamp", summary.timestamp]);
+    return el("div", { class: "domain" }, [el("h3", { text: title }), kvTable(rows)]);
+  }
+
+  function renderDomains(report) {
+    var t = report.technical_summary;
+    var m = report.macro_summary;
+    var n = report.news_summary;
+    var s = report.sentiment_summary;
+    return panel("Domain summaries", [
+      el("div", { class: "grid" }, [
+        domainBox("Macro", m, m ? [["key indicators", Array.isArray(m.key_indicators) ? String(m.key_indicators.length) : UNKNOWN]] : null),
+        domainBox("Market / Technical", t, t ? [["trend", t.trend_analysis], ["momentum", t.momentum]] : null),
+        domainBox("News", n, n ? [["key events", Array.isArray(n.key_events) ? String(n.key_events.length) : UNKNOWN]] : null),
+        domainBox("Sentiment", s, s ? [["distribution", s.sentiment_distribution]] : null)
+      ])
+    ]);
+  }
+
+  function renderTradeSetup(report, pipelineSummary) {
+    var ts = report.trade_setup_summary;
+    if (!ts) return panel("Trade setup", [el("p", { class: "none", text: "NOT AVAILABLE — no trade setup report reached the Chief Trading Manager." })]);
+    var levels = Array.isArray(ts.potential_levels) ? ts.potential_levels : [];
+    var levelNode;
+    if (levels.length === 0) {
+      levelNode = el("p", { class: "none", text: "(none)" });
+    } else {
+      var tbody = el("tbody");
+      levels.forEach(function (lv) {
+        lv = lv || {};
+        tbody.appendChild(el("tr", null, [
+          el("td", null, [val(lv.level)]), el("td", null, [val(lv.role || lv.type)]),
+          el("td", null, [val(lv.timeframe)]), el("td", null, [val(lv.strength)]), el("td", null, [val(lv.confidence)])
+        ]));
+      });
+      levelNode = el("table", { class: "wide" }, [
+        el("thead", null, [el("tr", null, [el("th", { text: "Level" }), el("th", { text: "Role" }), el("th", { text: "Timeframe" }), el("th", { text: "Strength" }), el("th", { text: "Confidence" })])]),
+        tbody
+      ]);
+    }
+    return panel("Trade setup", [
+      el("p", { class: "hint", text: "\"direction\" is the direction of an analysed setup, never an instruction to buy or sell." }),
+      kvTable([
+        ["setup_status", ts.setup_status],
+        ["direction", ts.direction],
+        ["setup_quality (confluence-based)", ts.setup_quality],
+        ["confidence", ts.confidence],
+        ["pipeline trade_setup_status", pipelineSummary && pipelineSummary.trade_setup_status]
+      ]),
+      el("h3", { text: "Potential levels" }),
+      levelNode
+    ]);
+  }
+
+  function renderEvidence(pipelineResult, report) {
+    return panel("Evidence, warnings & errors", [
+      el("h3", { text: "Supporting evidence" }), list(report.supporting_evidence, renderSupporting),
+      el("h3", { text: "Conflicting evidence" }), list(report.conflicting_evidence, renderConflict),
+      el("h3", { text: "Missing information" }), list(report.missing_information),
+      el("h3", { text: "Uncertainties" }), list(report.uncertainties),
+      el("h3", { text: "Key assumptions" }), list(report.key_assumptions),
+      el("h3", { text: "Warnings" }), list(pipelineResult.warnings, textOf),
+      el("h3", { text: "Errors" }), list(pipelineResult.errors, textOf),
+      el("h3", { text: "Sources" }), list(report.sources)
+    ]);
+  }
+
+  function renderDiagnostics(result) {
+    var d = result.diagnostics;
+    var persistence = result.persistence || {};
+    var rows = [
+      ["run_id", persistence.run_id],
+      ["run record", persistence.status]
+    ];
+    if (d && typeof d === "object") {
+      rows.push(["resolved instrument", d.instrument && d.instrument.normalizedSymbol]);
+      ["macro", "market", "news"].forEach(function (k) {
+        var dom = d[k];
+        if (!dom) { rows.push([k + " provider", "not requested"]); return; }
+        var pr = dom.providerResult;
+        var summary;
+        if (pr) summary = pr.ok ? "ok" + (isMissing(pr.recordCount) ? "" : " (" + pr.recordCount + " records)") : (pr.code || "failed") + (pr.message ? " — " + pr.message : "");
+        else if (Array.isArray(dom.seriesResults)) summary = dom.seriesResults.length + " series result(s)";
+        else summary = UNKNOWN;
+        var warn = Array.isArray(dom.warnings) && dom.warnings.length ? " | warnings: " + dom.warnings.map(function (w) { return typeof w === "string" ? w : compact(w, 160); }).join("; ") : "";
+        rows.push([k + " provider", summary + warn]);
+      });
+    } else {
+      rows.push(["providers", "no provider diagnostics (no live domain was enabled, or the request was rejected before providers ran)"]);
+    }
+    return panel("Run & provider diagnostics", [kvTable(rows)]);
+  }
+
+  function renderAdvisory(llm) {
+    var header = [
+      el("h2", null, [el("span", { class: "tag", text: "ADVISORY — CLAUDE" })]),
+      el("p", { text: "Optional commentary written after the deterministic decision above was already final. It did not influence final_assessment, decision_status, risk_decision, or any risk computation, and it is not an instruction to trade." }),
+      kvTable([["status", llm.status]])
+    ];
+    var body = [];
+    if (llm.status !== "VALID" || !llm.output) {
+      body.push(kvTable([["code", llm.code], ["message", llm.message]]));
+      if (Array.isArray(llm.errors) && llm.errors.length) {
+        body.push(el("h3", { text: "Rejected because" }), list(llm.errors, textOf));
+      }
+      body.push(el("p", { class: "none", text: "No advisory commentary is shown for a non-VALID result." }));
+    } else {
+      var o = llm.output;
+      body.push(el("h3", { text: "Narrative (advisory)" }), el("p", null, [val(o.narrative_summary)]));
+      body.push(el("h3", { text: "Key factors (advisory)" }), list(o.key_factors, function (f) {
+        if (!f || typeof f !== "object") return val(f);
+        var g = function (x) { return isMissing(x) ? UNKNOWN : String(x); };
+        return val("[" + g(f.direction) + "] " + g(f.factor) + " (ref: " + g(f.evidence_ref) + ")");
+      }));
+      body.push(el("h3", { text: "Risk commentary (advisory)" }), el("p", null, [val(o.risk_commentary)]));
+      body.push(el("h3", { text: "Uncertainties acknowledged (advisory)" }), list(o.uncertainties_acknowledged));
+      body.push(el("h3", { text: "Caveats (advisory)" }), list(o.caveats));
+    }
+    return el("section", { class: "panel advisory", "aria-label": "ADVISORY — CLAUDE" }, header.concat(body));
+  }
+
+  function renderRaw(result) {
+    var pre = el("pre");
+    pre.textContent = JSON.stringify(result, null, 2);
+    return el("section", { class: "panel" }, [el("details", null, [el("summary", { text: "Show raw JSON" }), pre])]);
+  }
+
+  function renderResult(result) {
+    var out = $("results");
+    out.textContent = "";
+    var pipelineResult = (result && result.pipelineResult) || {};
+    var report = pipelineResult.response || null;
+
+    if (!report) {
+      out.appendChild(panel("No final assessment", [
+        el("div", { class: "notice warn", text: "The run did not reach a Chief Trading Manager report, so no decision was computed. The errors below explain why." }),
+        el("h3", { text: "Errors" }),
+        list([].concat(Array.isArray(pipelineResult.errors) ? pipelineResult.errors : [])
+          .concat(pipelineResult.ok === false && pipelineResult.message ? [pipelineResult] : []), textOf),
+        el("h3", { text: "Warnings" }), list(pipelineResult.warnings, textOf)
+      ]));
+    } else {
+      out.appendChild(renderDecision(result, report));
+      out.appendChild(renderRisk(report));
+      out.appendChild(renderDomains(report));
+      out.appendChild(renderTradeSetup(report, pipelineResult.pipeline_summary));
+      out.appendChild(renderEvidence(pipelineResult, report));
+    }
+    out.appendChild(renderDiagnostics(result || {}));
+    if (result && result.llmAnnotation) out.appendChild(renderAdvisory(result.llmAnnotation));
+    out.appendChild(renderRaw(result));
+  }
+
+  // ---- errors / loading ----
+  function showError(message) {
+    var box = $("error");
+    box.textContent = message;
+    box.classList.remove("hidden");
+  }
+  function clearError() {
+    var box = $("error");
+    box.textContent = "";
+    box.classList.add("hidden");
+  }
+  function showFormWarnings(warnings) {
+    var box = $("form-warnings");
+    box.textContent = "";
+    if (warnings.length) box.appendChild(el("div", { class: "notice warn" }, [list(warnings)]));
+  }
+  function setLoading(on) {
+    $("analyze").disabled = on;
+    var status = $("status");
+    status.textContent = "";
+    if (on) {
+      status.appendChild(el("span", { class: "spinner", "aria-hidden": "true" }));
+      status.appendChild(document.createTextNode("Analyzing… live providers can take several seconds."));
+    }
+  }
+
+  function describeHttpError(res, body) {
+    var detail = body && typeof body === "object" && body.error ? String(body.error) : "";
+    if (res.status === 401) return "401 Unauthorized — the API token is missing or wrong (it must match the server's API_AUTH_TOKEN).";
+    if (res.status === 429) {
+      var retry = res.headers.get("Retry-After");
+      return "429 Too Many Requests — the server's rate limit was reached." + (retry ? " Try again in " + retry + " s." : "");
+    }
+    if (res.status >= 500) return res.status + " " + (detail || "Internal Server Error") + " — the server could not complete the analysis. Check the server log.";
+    return res.status + " " + (detail || res.statusText || "Request failed");
+  }
+
+  // ---- submit ----
+  var inFlight = false;
+  $("analyze-form").addEventListener("submit", function (event) {
+    event.preventDefault();
+    if (inFlight) return;
+    clearError();
+
+    var inv = buildInvocation();
+    showFormWarnings(inv.warnings);
+    if (!inv.asset) { showError("A symbol / asset is required."); $("asset").focus(); return; }
+    var token = memoryToken.trim();
+    if (!token) { showError("Enter the API token first (the server's API_AUTH_TOKEN)."); $("token").focus(); return; }
+
+    inFlight = true;
+    setLoading(true);
+    $("results").textContent = "";
+
+    fetch(ENDPOINT, {
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+      body: JSON.stringify({ request: inv.request, options: inv.options })
+    })
+      .then(function (res) {
+        return res.text().then(function (text) {
+          var body = null;
+          try { body = text ? JSON.parse(text) : null; } catch (e) { body = null; }
+          if (!res.ok) { showError(describeHttpError(res, body)); return; }
+          if (!body || typeof body !== "object") { showError("The server returned a response that is not valid JSON."); return; }
+          renderResult(body);
+        });
+      })
+      .catch(function () {
+        showError("Could not reach the server. Is it still running (npm start)?");
+      })
+      .then(function () {
+        inFlight = false;
+        setLoading(false);
+      });
+  });
+})();
+</script>
+</body>
+</html>

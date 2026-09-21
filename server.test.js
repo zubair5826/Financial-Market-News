@@ -829,3 +829,200 @@ test("106-4. a body-supplied options.runStore still overrides RUN_STORE_FILE", a
     }
   }
 });
+
+// --- Step 121: personal-use web interface (GET /) ---
+//
+// `GET /` serves the static file public/index.html. These tests pin
+// the route itself and prove it changed nothing else: API auth, API
+// rate limiting, 404/405 behavior, and the market-intelligence
+// endpoint's response shape are all exercised again here.
+
+const UI_PAGE_PATH = path.join(__dirname, "public", "index.html");
+
+test("121-1. GET / returns 200 with the HTML page", async () => {
+  await withRunningServer(async ({ baseUrl }) => {
+    const res = await fetch(`${baseUrl}/`);
+    assert.equal(res.status, 200);
+    assert.match(res.headers.get("content-type"), /^text\/html; charset=utf-8$/);
+    const html = await res.text();
+    assert.match(html, /^<!DOCTYPE html>/i);
+    assert.ok(html.includes("<title>Market Intelligence</title>"));
+    // Served byte-for-byte from public/index.html — nothing templated in.
+    assert.equal(html, fs.readFileSync(UI_PAGE_PATH, "utf8"));
+    assert.equal(Number(res.headers.get("content-length")), Buffer.byteLength(html));
+  });
+});
+
+test("121-2. GET / sends restrictive security headers (same-origin API calls only, no framing, no caching)", async () => {
+  await withRunningServer(async ({ baseUrl }) => {
+    const res = await fetch(`${baseUrl}/`);
+    assert.equal(res.status, 200);
+    const csp = res.headers.get("content-security-policy");
+    assert.ok(csp, "a Content-Security-Policy header is present");
+    assert.match(csp, /default-src 'none'/);
+    assert.match(csp, /connect-src 'self'/);
+    assert.match(csp, /frame-ancestors 'none'/);
+    assert.equal(res.headers.get("x-content-type-options"), "nosniff");
+    assert.equal(res.headers.get("x-frame-options"), "DENY");
+    assert.equal(res.headers.get("cache-control"), "no-store");
+    assert.equal(res.headers.get("referrer-policy"), "no-referrer");
+    await res.text();
+  });
+});
+
+test("121-3. GET / needs no token and never contains one — even when the server has none configured", async () => {
+  await withEnvVar("API_AUTH_TOKEN", undefined, async () => {
+    await withRunningServer(async ({ baseUrl }) => {
+      const res = await fetch(`${baseUrl}/`);
+      assert.equal(res.status, 200);
+      await res.text();
+      // The API itself still fails closed with no token configured.
+      const api = await fetch(`${baseUrl}/api/market-intelligence`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${TEST_AUTH_TOKEN}` },
+        body: JSON.stringify({ request: { query: "Assess SPY", asset: "SPY" }, options: RUN_STORE_OPTIONS }),
+      });
+      assert.equal(api.status, 401);
+    });
+  });
+  await withRunningServer(async ({ baseUrl }) => {
+    const html = await (await fetch(`${baseUrl}/`)).text();
+    assert.ok(!html.includes(TEST_AUTH_TOKEN), "the configured token is never embedded in the page");
+  });
+});
+
+test("121-4. only the exact path / is served — unknown routes and file-like paths are still 404", async () => {
+  await withRunningServer(async ({ baseUrl }) => {
+    for (const p of ["/does-not-exist", "/index.html", "/public/index.html", "/public/", "/server.js", "/%2e%2e/server.js", "//"]) {
+      const res = await fetch(`${baseUrl}${p}`);
+      assert.equal(res.status, 404, `${p} must remain 404`);
+      assert.deepEqual(await res.json(), { error: "Not Found" });
+    }
+  });
+});
+
+test("121-5. any method other than GET on / is 405 (JSON), never the page", async () => {
+  await withRunningServer(async ({ baseUrl }) => {
+    for (const method of ["POST", "PUT", "DELETE"]) {
+      const res = await fetch(`${baseUrl}/`, { method, headers: JSON_AUTH_HEADERS, body: "{}" });
+      assert.equal(res.status, 405);
+      assert.deepEqual(await res.json(), { error: "Method Not Allowed", allowed: ["GET"] });
+    }
+  });
+});
+
+test("121-6. GET / is exempt from rate limiting; POST / and every API route are still counted", async () => {
+  await withRateLimitEnv({ windowMs: 60_000, maxRequests: 2 }, async () => {
+    await withRunningServer(async ({ baseUrl }) => {
+      // Loading the page many times spends nothing.
+      for (let i = 0; i < 6; i++) {
+        const page = await fetch(`${baseUrl}/`);
+        assert.equal(page.status, 200);
+        await page.text();
+      }
+      // POST / is NOT exempt — it counts (1 of 2) and is answered 405.
+      const postRoot = await fetch(`${baseUrl}/`, { method: "POST" });
+      assert.equal(postRoot.status, 405);
+      // One real API call is still allowed (2 of 2)...
+      const api = await fetch(`${baseUrl}/api/market-intelligence`, {
+        method: "POST",
+        headers: JSON_AUTH_HEADERS,
+        body: JSON.stringify({ request: { query: "Assess SPY", asset: "SPY" }, options: RUN_STORE_OPTIONS }),
+      });
+      assert.equal(api.status, 200);
+      await api.json();
+      // ...and the next one is limited, exactly as before this route existed.
+      const limited = await fetch(`${baseUrl}/api/market-intelligence`, {
+        method: "POST",
+        headers: JSON_AUTH_HEADERS,
+        body: JSON.stringify({ request: { query: "Assess SPY", asset: "SPY" }, options: RUN_STORE_OPTIONS }),
+      });
+      assert.equal(limited.status, 429);
+      // The page still loads while the API is limited.
+      const pageAfter = await fetch(`${baseUrl}/`);
+      assert.equal(pageAfter.status, 200);
+      await pageAfter.text();
+    });
+  });
+});
+
+test("121-7. the API the page calls is unchanged: 401 without a token, 200 with the same four-field shape with one", async () => {
+  await withRunningServer(async ({ baseUrl }) => {
+    const body = JSON.stringify({ request: { query: "Assess SPY", asset: "SPY", options: {} }, options: RUN_STORE_OPTIONS });
+    const noToken = await fetch(`${baseUrl}/api/market-intelligence`, { method: "POST", headers: { "Content-Type": "application/json" }, body });
+    assert.equal(noToken.status, 401);
+    assert.deepEqual(await noToken.json(), { error: "Unauthorized" });
+
+    const wrongToken = await fetch(`${baseUrl}/api/market-intelligence`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer not-the-token" },
+      body,
+    });
+    assert.equal(wrongToken.status, 401);
+    await wrongToken.json();
+
+    const ok = await fetch(`${baseUrl}/api/market-intelligence`, { method: "POST", headers: JSON_AUTH_HEADERS, body });
+    assert.equal(ok.status, 200);
+    const result = await ok.json();
+    assert.deepEqual(Object.keys(result).sort(), ["diagnostics", "llmAnnotation", "persistence", "pipelineResult"]);
+    assert.equal(result.llmAnnotation, null, "the Claude layer stays off unless options.llm.enabled === true");
+  });
+});
+
+test("121-8. a missing/unreadable page file becomes the generic 500 — no path or error detail leaks", async () => {
+  const originalReadFile = fs.promises.readFile;
+  fs.promises.readFile = async () => {
+    const err = new Error(`ENOENT: no such file or directory, open '${UI_PAGE_PATH}'`);
+    err.code = "ENOENT";
+    throw err;
+  };
+  try {
+    await withRunningServer(async ({ baseUrl }) => {
+      const res = await fetch(`${baseUrl}/`);
+      assert.equal(res.status, 500);
+      const text = await res.text();
+      assert.deepEqual(JSON.parse(text), { error: "Internal Server Error" });
+      assert.ok(!text.includes("public") && !text.includes("ENOENT"));
+    });
+  } finally {
+    fs.promises.readFile = originalReadFile;
+  }
+});
+
+test("121-9. UI_PAGE_FILE is fixed relative to server.js, never derived from the request", () => {
+  const { UI_PAGE_FILE } = freshServerModule();
+  assert.equal(UI_PAGE_FILE, UI_PAGE_PATH);
+});
+
+// Static guarantees about the page itself — read from disk, no browser.
+test("121-10. the page calls only /api/market-intelligence, hardcodes no token, and keeps Claude opt-in and advisory", () => {
+  const html = fs.readFileSync(UI_PAGE_PATH, "utf8");
+
+  // One endpoint, the existing one; no other API route and no absolute URL.
+  assert.ok(html.includes('var ENDPOINT = "/api/market-intelligence";'));
+  assert.ok(!/\/api\/(intelligence|portfolio-intelligence)["'`]/.test(html));
+  assert.ok(!/fetch\(\s*["'`]https?:/i.test(html));
+  assert.ok(!/<script[^>]+src=/i.test(html), "no external script");
+  assert.ok(!/<link[^>]+href=/i.test(html), "no external stylesheet");
+
+  // No credential is hardcoded: the only Bearer value is the user's input.
+  assert.ok(/"Bearer " \+ token/.test(html));
+  assert.equal((html.match(/Bearer /g) || []).length, 1);
+  assert.ok(!/API_AUTH_TOKEN\s*=/.test(html));
+  assert.ok(!html.includes("localStorage"), "token is memory/sessionStorage only");
+  assert.ok(!/runStore/.test(html), "the page never redirects the run store");
+
+  // Domain checkboxes on by default; Claude checkbox off by default.
+  assert.match(html, /<input id="opt-macro" type="checkbox" checked>/);
+  assert.match(html, /<input id="opt-market" type="checkbox" checked>/);
+  assert.match(html, /<input id="opt-news" type="checkbox" checked>/);
+  assert.match(html, /<input id="opt-llm" type="checkbox">/);
+  assert.ok(html.includes("ADVISORY \u2014 CLAUDE"), "the Claude block is labelled ADVISORY — CLAUDE");
+
+  // Response data is written with textContent only.
+  assert.ok(!/\.innerHTML\s*=/.test(html));
+  assert.ok(!/insertAdjacentHTML|document\.write/.test(html));
+
+  // No trading/broker/execution surface.
+  assert.ok(!/placeOrder|submitOrder|executeTrade|\bbroker(Api|Client)\b/i.test(html));
+});

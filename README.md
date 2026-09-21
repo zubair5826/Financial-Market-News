@@ -30,6 +30,10 @@ supplied; the other two (sentiment, and the Data Controller's generic
 market-value domain) still have their data supplied by hand (tests) or
 by a caller.
 
+A personal-use web interface (`GET /`, [public/index.html](public/index.html))
+now sits on top of the HTTP API for asking a question and reading the
+deterministic result in a browser — see [Web interface](#web-interface-publicindexhtml).
+
 ## System Architecture
 
 ```
@@ -436,12 +440,60 @@ error. To keep run history, mount a volume and point `RUN_STORE_FILE`
 at it. Log output has no equivalent override today — see Known
 Limitations.
 
+## Web interface (`public/index.html`)
+
+A personal-use web page for asking one market question and reading the
+deterministic result. It is served by the same server as the API —
+nothing extra to install or build.
+
+```bash
+API_AUTH_TOKEN="pick-a-long-random-secret" node --env-file=.env server.js
+# or, with the variables already exported:  npm start
+```
+
+Then open **http://localhost:3000/** (or the `PORT` you set). On the
+page:
+
+1. Type a symbol (e.g. `SPY`) and, optionally, a question.
+2. Macro, Market and News are all ticked by default — untick any you
+   don't want. Optionally add market timeframes and all six
+   position-sizing values (all six or none; nothing is assumed).
+3. Paste the server's `API_AUTH_TOKEN` into **API token**. It stays in
+   the page's memory only; tick "Remember for this browser tab" to keep
+   it in `sessionStorage` until the tab is closed. It is never stored
+   anywhere else, never written into the page, and never sent anywhere
+   except this same server.
+4. Press **Analyze**.
+
+The page calls the existing `POST /api/market-intelligence` with the
+same `{ request, options }` shape `runAgent.js` builds, and sets
+`options.macro/market/news.enabled` from the checkboxes. It shows the
+Decision (`final_assessment`, `decision_status`) first, then data
+quality and risk, the four domain summaries, the trade setup, evidence,
+warnings and errors, provider diagnostics, and a collapsed raw-JSON
+view. Missing values show as `UNKNOWN`.
+
+The Claude checkbox is **off by default**. When ticked (and
+`ANTHROPIC_API_KEY` is set on the server), the commentary appears last,
+in a separate block labelled **ADVISORY — CLAUDE**; it never changes the
+deterministic decision. The page is decision intelligence only: **no
+broker or exchange is connected and nothing is ever executed**.
+
+On a deployment (e.g. Railway), the same page is at the deployment's
+root URL; only use it over HTTPS there, because the token travels in a
+request header.
+
+Loading the page (`GET /`) needs no token and does not count against
+the rate limit; every analysis request is still authenticated and
+rate-limited exactly like any other API call.
+
 ## HTTP API (`server.js`)
 
-`npm start`. Four routes, no framework, no dependencies:
+`npm start`. Five routes, no framework, no dependencies:
 
 | Route | Auth | Rate limited | Body |
 |---|---|---|---|
+| `GET /` | none (static page; holds no token) | no | — |
 | `GET /health` | none | no | — |
 | `POST /api/intelligence` | `Authorization: Bearer $API_AUTH_TOKEN` | yes | `{ request, options }` |
 | `POST /api/portfolio-intelligence` | same | yes | the request object itself |
@@ -479,6 +531,15 @@ lookup, method checks and body parsing, so it cannot be dodged by
 hitting an unknown path; `X-Forwarded-For` is honored only under an
 explicit `TRUST_PROXY` opt-in, so a forged header cannot open a fresh
 rate-limit bucket; internal errors never leak a message or stack.
+
+`GET /` serves the static file `public/index.html` and nothing else —
+only that exact method and path (`/index.html`, `/public/...` and every
+other unknown path remain `404`; any other method on `/` is `405` and is
+rate-limited). The page is sent with a strict Content-Security-Policy
+(`default-src 'none'`, `connect-src 'self'`, `frame-ancestors 'none'`),
+`X-Frame-Options: DENY`, `Cache-Control: no-store` and
+`Referrer-Policy: no-referrer`, so the token the user types can only
+ever be sent back to this same server.
 
 **This process does not terminate TLS.** Put it behind a reverse proxy
 or platform that does, and set `TRUST_PROXY=1` there.
@@ -672,6 +733,9 @@ see [Fail-Safe Guarantees](#fail-safe-guarantees)).
 - `config/` — centralized freshness policy. **IMPLEMENTED.**
 - `data/` — persisted run records (`runs.jsonl`, gitignored) plus
   `runStore.js`. **IMPLEMENTED.**
+- `public/` — `index.html`, the self-contained personal-use web
+  interface served at `GET /` (plain HTML/CSS/JS, no build step, no
+  dependency). **IMPLEMENTED** — see [Web interface](#web-interface-publicindexhtml).
 - `prompts/` — reserved for future agent system prompts. **NOT
   IMPLEMENTED** (empty).
 - `llm/` — the isolated, opt-in Claude/Anthropic annotation layer
@@ -690,7 +754,7 @@ see [Fail-Safe Guarantees](#fail-safe-guarantees)).
   run wrote to the production `data/runs.jsonl`. **IMPLEMENTED.**
 
 Root-level entrypoints (all above the pipeline, none inside it):
-`server.js` (HTTP API), `app.js` (the single application boundary:
+`server.js` (HTTP API + the `GET /` web page), `app.js` (the single application boundary:
 freshness policy, run persistence, optional LLM annotation),
 `portfolioIntelligence.js`, and the `run*.js` CLI runners.
 

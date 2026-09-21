@@ -106,7 +106,53 @@ That key only matters if you explicitly opt into the isolated,
 additive reasoning layer under `llm/` (`options.llm.enabled === true`)
 — see README.md's Known Limitations section.
 
-## 4. Run the HTTP API
+## 4. Use the web interface (browser)
+
+The same server that runs the API also serves a simple web page at
+`/`. Start it with your real keys and a token of your choice:
+
+```bash
+# Node 20.6+: load .env and set the token for the page/API
+API_AUTH_TOKEN="pick-a-long-random-secret" node --env-file=.env server.js
+
+# Or export everything first (any Node 18+), then:
+npm start
+```
+
+Open **http://localhost:3000/** in your browser, then:
+
+1. Type a symbol (e.g. `SPY`) and, if you like, a question.
+2. Leave Macro, Market and News ticked (the default) or untick any.
+   Optional: market timeframes (`1day,1week`) and the six
+   position-sizing values — all six or none, nothing is assumed.
+3. Paste the same value you used for `API_AUTH_TOKEN` into
+   **API token**. It is kept in the page's memory only (or in this
+   browser tab's `sessionStorage` if you tick "Remember for this browser
+   tab"). It is never written into the page or sent anywhere except
+   this server.
+4. Press **Analyze** and wait — live providers can take several
+   seconds.
+
+The page calls the existing `POST /api/market-intelligence` endpoint —
+exactly the request `runAgent.js` makes — and shows the Decision first
+(`final_assessment`, `decision_status`), then data quality and risk,
+the domain summaries, the trade setup, evidence, warnings and errors.
+"Show raw JSON" at the bottom shows the full response.
+
+- **Claude is optional and advisory.** The Claude box is off by
+  default. If you tick it (and `ANTHROPIC_API_KEY` is set), the
+  commentary appears last in a separate **ADVISORY — CLAUDE** block. It
+  never changes the deterministic result.
+- **No trading happens.** The page only displays analysis. No broker or
+  exchange is connected, and nothing is ever bought, sold, or executed.
+- A `401` on the page means the token doesn't match `API_AUTH_TOKEN`;
+  a `429` means you hit the rate limit (loading the page itself never
+  counts). Every page run is saved to `data/runs.jsonl` like any other
+  API run.
+- Deployed (e.g. on Railway), the page is at the deployment's root URL.
+  Use it over HTTPS only.
+
+## 5. Run the HTTP API
 
 ```bash
 API_AUTH_TOKEN="pick-a-long-random-secret" npm start
@@ -149,11 +195,12 @@ Things to know before exposing it:
 
 `README.md` has the full table of environment variables.
 
-## 5. Where the output goes
+## 6. Where the output goes
 
 - `data/runs.jsonl` — one JSON line per completed run through
   `runAgent.js`, `runIntelligence.js`, `/api/intelligence` or
-  `/api/market-intelligence`, credentials redacted. Override the path
+  `/api/market-intelligence` (including every run from the web page),
+  credentials redacted. Override the path
   with `RUN_STORE_FILE`.
 - `logs/system.log` — one structured line per agent call, rotated at 5 MB.
 
